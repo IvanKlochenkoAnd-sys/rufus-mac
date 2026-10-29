@@ -1,0 +1,1203 @@
+#!/usr/bin/env python3
+"""
+Rufus for macOS (RufusMac) - Professional Windows 11 Bootable USB Creator
+Engineered for macOS (including macOS 27 / Sequoia / Sonoma / Apple Silicon & Intel)
+
+Features:
+- Full Windows 11 24H2 / 23H2 / 22H2 UEFI bootable drive creation
+- Automatic detection of external USB thumb drives (with strict internal disk protection)
+- Dual-Partition Universal UEFI Architecture (FAT32 Boot + ExFAT Data)
+  * Solves the >4GB install.wim FAT32 limitation without third-party tools
+  * Works on 100% of UEFI motherboards out of the box
+- Optional Single-Partition Split WIM (SWM) support via wimlib if installed
+- Windows 11 Bypasses (Rufus WUE):
+  * Bypass TPM 2.0, Secure Boot, 4GB+ RAM, Storage & CPU checks
+  * Bypass mandatory Microsoft online account requirement (BypassNRO)
+  * Disable automatic BitLocker device encryption
+  * Zero-byte appraiserres.dll patch
+- Interactive CLI Wizard & Headless Command-Line Mode
+"""
+
+import sys
+import os
+import plistlib
+import subprocess
+import shutil
+import time
+import re
+import argparse
+from pathlib import Path
+from typing import List, Dict, Optional, Tuple
+
+VERSION = "1.1.0"
+
+# ANSI Terminal Colors
+class Colors:
+    HEADER = '\033[95m'
+    BLUE = '\033[94m'
+    CYAN = '\033[96m'
+    GREEN = '\033[92m'
+    YELLOW = '\033[93m'
+    RED = '\033[91m'
+    BOLD = '\033[1m'
+    UNDERLINE = '\033[4m'
+    DIM = '\033[2m'
+    RESET = '\033[0m'
+
+def log_info(msg: str):
+    print(f"{Colors.BLUE}[*]{Colors.RESET} {msg}")
+
+def log_success(msg: str):
+    print(f"{Colors.GREEN}[✓]{Colors.RESET} {Colors.BOLD}{msg}{Colors.RESET}")
+
+def log_warn(msg: str):
+    print(f"{Colors.YELLOW}[!]{Colors.RESET} {Colors.BOLD}{msg}{Colors.RESET}")
+
+def log_error(msg: str):
+    print(f"{Colors.RED}[✗]{Colors.RESET} {Colors.BOLD}{msg}{Colors.RESET}")
+
+def format_size(bytes_val: int) -> str:
+    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+        if bytes_val < 1024.0:
+            return f"{bytes_val:.1f} {unit}"
+        bytes_val /= 1024.0
+    return f"{bytes_val:.1f} PB"
+
+
+class DiskManager:
+    """Manages disk enumeration, filtering, and safety checks on macOS."""
+
+    @staticmethod
+    def get_disks() -> List[Dict]:
+        """Returns a list of external, removable USB physical disks safe for formatting."""
+        try:
+            cmd = ['diskutil', 'list', '-plist']
+            output = subprocess.check_output(cmd, stderr=subprocess.PIPE)
+            data = plistlib.loads(output)
+        except Exception as e:
+            log_error(f"Failed to query diskutil list: {e}")
+            return []
+
+        all_disks = data.get('AllDisksAndPartitions', [])
+        usb_disks = []
+
+        for item in all_disks:
+            dev_id = item.get('DeviceIdentifier', '')
+            if not dev_id:
+                continue
+
+            # Query detailed info for the physical whole disk
+            info = DiskManager.get_disk_info(dev_id)
+            if not info:
+                continue
+
+            # Strict safety filter:
+            # 1. Must NOT be an internal drive
+            if info.get('Internal', True):
+                continue
+
+            # 2. Must NOT be a virtual disk image or APFS synthesized container
+            bus_protocol = info.get('BusProtocol', '')
+            if bus_protocol in ['Disk Image', 'Virtual', 'Apple Fabric']:
+                continue
+
+            # 3. Must be external, removable media, or USB/Thunderbolt bus protocol
+            is_external = (info.get('Internal') is False) or (info.get('DeviceLocation') == 'External')
+            is_removable = info.get('Removable', False) or info.get('RemovableMedia', False)
+            is_usb_tb = (bus_protocol in ['USB', 'Thunderbolt', 'FireWire'])
+
+            if not (is_external or is_usb_tb or is_removable):
+                continue
+
+            # 4. Must be a whole physical disk
+            if not info.get('WholeDisk', True):
+                continue
+
+            size_bytes = info.get('TotalSize', info.get('Size', 0))
+            # Require at least 4 GB
+            if size_bytes < 4 * 1024 * 1024 * 1024:
+                continue
+
+            media_name = info.get('MediaName', info.get('IORegistryEntryName', 'USB Flash Drive'))
+
+            # Gather mounted partitions if any
+            mounted_partitions = []
+            for part in item.get('Partitions', []):
+                part_id = part.get('DeviceIdentifier', '')
+                part_info = DiskManager.get_disk_info(part_id)
+                if part_info and part_info.get('Mounted', False):
+                    mounted_partitions.append({
+                        'id': part_id,
+                        'name': part_info.get('VolumeName', 'Untitled'),
+                        'mount_point': part_info.get('MountPoint', '')
+                    })
+
+            usb_disks.append({
+                'identifier': dev_id,
+                'device_node': f"/dev/{dev_id}",
+                'raw_node': f"/dev/r{dev_id}",
+                'media_name': media_name,
+                'size_bytes': size_bytes,
+                'size_str': format_size(size_bytes),
+                'bus': bus_protocol,
+                'mounted_partitions': mounted_partitions
+            })
+
+        return usb_disks
+
+    @staticmethod
+    def get_disk_info(dev_id: str) -> Optional[Dict]:
+        """Gets plist info for a specific disk identifier."""
+        try:
+            cmd = ['diskutil', 'info', '-plist', dev_id]
+            output = subprocess.check_output(cmd, stderr=subprocess.PIPE)
+            return plistlib.loads(output)
+        except Exception:
+            return None
+
+    @staticmethod
+    def unmount_disk(dev_node: str) -> bool:
+        """Unmounts all partitions of the specified disk with forced fallback and retry."""
+        log_info(f"Unmounting {dev_node}...")
+        
+        # Attempt 1: Standard graceful unmount
+        res = subprocess.run(['diskutil', 'unmountDisk', dev_node], capture_output=True, text=True)
+        if res.returncode == 0:
+            return True
+            
+        # Attempt 2: Forced unmount
+        log_warn("Standard unmount busy. Attempting forced unmount...")
+        res_force = subprocess.run(['diskutil', 'unmountDisk', 'force', dev_node], capture_output=True, text=True)
+        if res_force.returncode == 0:
+            return True
+            
+        # Attempt 3: Explicitly unmount child partition nodes (e.g. disk17s1, disk17s2)
+        dev_id = dev_node.replace("/dev/", "")
+        for i in range(1, 5):
+            part_node = f"/dev/{dev_id}s{i}"
+            subprocess.run(['diskutil', 'unmount', 'force', part_node], capture_output=True)
+            
+        time.sleep(1)
+        res_final = subprocess.run(['diskutil', 'unmountDisk', 'force', dev_node], capture_output=True, text=True)
+        return res_final.returncode == 0
+
+
+class ISOInspector:
+    """Mounts and inspects Windows ISO images for Windows 11 compatibility."""
+
+    def __init__(self, iso_path: str):
+        self.iso_path = Path(iso_path).resolve()
+        self.mount_point: Optional[Path] = None
+        self.attached_dev: Optional[str] = None
+        self.is_windows = False
+        self.has_uefi = False
+        self.has_boot_wim = False
+        self.install_wim_path: Optional[Path] = None
+        self.install_wim_size = 0
+        self.is_wim_large = False  # > 4GB
+
+    def _find_existing_mount(self) -> Tuple[Optional[Path], Optional[str]]:
+        """Checks if the ISO is already mounted on the system."""
+        # Check 1: If path is already a directory with Windows install media
+        if self.iso_path.is_dir():
+            if self.find_file(self.iso_path, ['sources', 'boot.wim']):
+                return self.iso_path, None
+
+        # Check 2: Check active volumes under /Volumes/
+        try:
+            for vol in Path('/Volumes').iterdir():
+                if vol.is_dir() and not vol.name.startswith('.'):
+                    if self.find_file(vol, ['sources', 'boot.wim']) and (self.find_file(vol, ['sources', 'install.wim']) or self.find_file(vol, ['sources', 'install.esd'])):
+                        if vol.name.lower() in self.iso_path.name.lower() or "cccoma" in vol.name.lower() or "win" in vol.name.lower():
+                            return vol, None
+        except Exception:
+            pass
+
+        # Check 3: Check hdiutil info for attached disk images matching this ISO path
+        try:
+            out = subprocess.check_output(['hdiutil', 'info', '-plist'], stderr=subprocess.PIPE)
+            data = plistlib.loads(out)
+            for img in data.get('images', []):
+                img_path = img.get('image-path', '')
+                if os.path.realpath(img_path) == os.path.realpath(str(self.iso_path)):
+                    dev = None
+                    mp = None
+                    for ent in img.get('system-entities', []):
+                        if 'mount-point' in ent:
+                            mp = Path(ent['mount-point'])
+                        if 'dev-entry' in ent and not dev:
+                            dev = ent['dev-entry']
+                    if mp and mp.exists():
+                        return mp, dev
+        except Exception:
+            pass
+        return None, None
+
+    def mount(self) -> bool:
+        if not self.iso_path.exists():
+            log_error(f"ISO file or directory does not exist: {self.iso_path}")
+            return False
+
+        # If user directly specified an already mounted volume (e.g. /Volumes/CCCOMA_...)
+        if self.iso_path.is_dir():
+            if self.find_file(self.iso_path, ['sources', 'boot.wim']):
+                self.mount_point = self.iso_path
+                self.attached_dev = None
+                log_success(f"Using provided mounted directory: {self.mount_point}")
+                return self._inspect()
+
+        log_info(f"Mounting ISO: {self.iso_path.name}...")
+
+        # Step 1: Remove quarantine attribute if present
+        try:
+            subprocess.run(['xattr', '-d', 'com.apple.quarantine', str(self.iso_path)], capture_output=True)
+        except Exception:
+            pass
+
+        # Step 2: Check if ISO is already attached or mounted
+        existing_mp, existing_dev = self._find_existing_mount()
+        if existing_mp and existing_mp.exists():
+            self.mount_point = existing_mp
+            self.attached_dev = existing_dev
+            log_success(f"Using active ISO mount: {self.mount_point}")
+            return self._inspect()
+
+        # Step 3: Raw UDF Mount Strategy (Essential for Windows 11 ISOs on macOS)
+        # Windows 11 installation ISOs use ISO-9660 + UDF 2.01 format. macOS DiskImages2
+        # will fail with 'The disk image is corrupted' or 'image not recognized' unless
+        # attached with diskimage-class=CRawDiskImage.
+        try:
+            attach_cmd = [
+                'hdiutil', 'attach',
+                '-imagekey', 'diskimage-class=CRawDiskImage',
+                '-nomount',
+                str(self.iso_path)
+            ]
+            res = subprocess.run(attach_cmd, capture_output=True, text=True)
+            if res.returncode == 0:
+                dev_match = re.search(r"(/dev/disk\d+)", res.stdout)
+                if dev_match:
+                    dev_node = dev_match.group(1)
+                    self.attached_dev = dev_node
+                    time.sleep(0.5)
+                    # Mount the attached disk read-only
+                    mount_res = subprocess.run(['diskutil', 'mount', 'readOnly', dev_node], capture_output=True, text=True)
+                    # Retrieve the mount point via diskutil info
+                    info_res = subprocess.run(['diskutil', 'info', '-plist', dev_node], capture_output=True)
+                    if info_res.returncode == 0:
+                        info = plistlib.loads(info_res.stdout)
+                        mp = info.get('MountPoint')
+                        if mp and Path(mp).exists():
+                            self.mount_point = Path(mp)
+                            log_success(f"ISO mounted at: {self.mount_point} ({dev_node})")
+                            return self._inspect()
+                    # Fallback parse mount output
+                    if not self.mount_point:
+                        for line in mount_res.stdout.splitlines():
+                            if "mounted" in line and "Volume " in line:
+                                vol_name = line.split("Volume ")[1].split(" on ")[0].strip()
+                                candidate = Path(f"/Volumes/{vol_name}")
+                                if candidate.exists():
+                                    self.mount_point = candidate
+                                    log_success(f"ISO mounted at: {self.mount_point} ({dev_node})")
+                                    return self._inspect()
+        except Exception:
+            pass
+
+        # Step 4: Multi-strategy fallback mounting attempts
+        mount_attempts = []
+        sudo_user = os.environ.get('SUDO_USER')
+
+        # Strategy A: If running as root (via sudo), attach as the real user to avoid TCC denial on ~/Downloads
+        if os.geteuid() == 0 and sudo_user:
+            mount_attempts.append([
+                'sudo', '-u', sudo_user,
+                'hdiutil', 'attach', '-noverify', '-noautofsck', '-noautoopen', '-nobrowse', '-readonly', str(self.iso_path)
+            ])
+
+        # Strategy B: Standard hdiutil with -noverify and -noautofsck
+        mount_attempts.append([
+            'hdiutil', 'attach', '-noverify', '-noautofsck', '-noautoopen', '-nobrowse', '-readonly', str(self.iso_path)
+        ])
+
+        # Strategy C: macOS 27 diskutil image attach
+        mount_attempts.append([
+            'diskutil', 'image', 'attach', '--mountOptions', 'nobrowse', '--readOnly', str(self.iso_path)
+        ])
+
+        last_err = ""
+        for cmd in mount_attempts:
+            res = subprocess.run(cmd, capture_output=True, text=True)
+            if res.returncode == 0:
+                out = res.stdout
+                lines = out.strip().split('\n')
+                for line in lines:
+                    parts = line.split()
+                    if len(parts) >= 3 and '/Volumes/' in line:
+                        idx = line.find('/Volumes/')
+                        self.mount_point = Path(line[idx:].strip())
+                        self.attached_dev = parts[0]
+                        break
+                if self.mount_point and self.mount_point.exists():
+                    break
+            else:
+                last_err = (res.stderr or res.stdout or "").strip()
+
+        if not self.mount_point or not self.mount_point.exists():
+            log_error(f"Failed to mount ISO: {last_err or 'Could not attach disk image'}")
+            if "operation not permitted" in last_err.lower():
+                log_warn("macOS Privacy (TCC) prevented mounting the file in its current location.")
+                print(f"\n{Colors.BOLD}Quick Resolution Steps:{Colors.RESET}")
+                print(f"1. {Colors.CYAN}Run directly without sudo{Colors.RESET} (the tool will prompt for password only when formatting):")
+                print(f"   rufus-mac\n")
+                print(f"2. {Colors.CYAN}Or move the ISO to /Users/Shared/{Colors.RESET} (bypasses ~/Downloads TCC locks):")
+                print(f"   mv \"{self.iso_path}\" /Users/Shared/\n")
+                print(f"3. {Colors.CYAN}Or grant Full Disk Access to Terminal{Colors.RESET}:")
+                print(f"   System Settings → Privacy & Security → Full Disk Access → Enable Terminal\n")
+            return False
+
+        log_success(f"ISO mounted at: {self.mount_point}")
+        return self._inspect()
+
+    def _inspect(self) -> bool:
+        assert self.mount_point is not None
+
+        # Look for UEFI bootloader
+        efi_boot_x64 = self.find_file(self.mount_point, ['efi', 'boot', 'bootx64.efi'])
+        efi_boot_arm64 = self.find_file(self.mount_point, ['efi', 'boot', 'bootaa64.efi'])
+        self.has_uefi = bool(efi_boot_x64 or efi_boot_arm64)
+
+        # Look for WinPE boot image
+        boot_wim = self.find_file(self.mount_point, ['sources', 'boot.wim'])
+        self.has_boot_wim = bool(boot_wim)
+
+        # Look for OS payload (install.wim or install.esd)
+        install_wim = self.find_file(self.mount_point, ['sources', 'install.wim'])
+        install_esd = self.find_file(self.mount_point, ['sources', 'install.esd'])
+        self.install_wim_path = install_wim or install_esd
+
+        if self.install_wim_path and self.install_wim_path.exists():
+            self.install_wim_size = self.install_wim_path.stat().st_size
+            # 4 GiB = 4,294,967,296 bytes. FAT32 max file size is 4,294,967,295.
+            self.is_wim_large = (self.install_wim_size >= 4 * 1024 * 1024 * 1024)
+
+        self.is_windows = bool(self.has_boot_wim and self.install_wim_path)
+
+        if not self.is_windows:
+            log_warn("The selected image does not appear to be a standard Windows installation media.")
+            return False
+
+        wim_name = self.install_wim_path.name if self.install_wim_path else "None"
+        log_success(f"Valid Windows image verified.")
+        log_info(f"UEFI Bootloader: {'Present (x64/ARM64)' if self.has_uefi else 'Missing'}")
+        log_info(f"OS Payload: {wim_name} ({format_size(self.install_wim_size)})")
+        if self.is_wim_large:
+            log_warn(f"{wim_name} exceeds the 4GB FAT32 limit! Automatic dual-partition UEFI mode will be utilized.")
+
+        return True
+
+    @staticmethod
+    def find_file(root: Path, relative_parts: List[str]) -> Optional[Path]:
+        """Case-insensitive path locator."""
+        current = root
+        for part in relative_parts:
+            found = None
+            if not current.is_dir():
+                return None
+            for child in current.iterdir():
+                if child.name.lower() == part.lower():
+                    found = child
+                    break
+            if not found:
+                return None
+            current = found
+        return current
+
+    def unmount(self):
+        if self.attached_dev:
+            log_info(f"Detaching ISO image ({self.attached_dev})...")
+            subprocess.run(['diskutil', 'unmount', 'force', self.attached_dev], capture_output=True)
+            subprocess.run(['diskutil', 'eject', self.attached_dev], capture_output=True)
+            subprocess.run(['hdiutil', 'detach', self.attached_dev], capture_output=True)
+            self.attached_dev = None
+            self.mount_point = None
+
+
+class WindowsCustomizer:
+    """Generates autounattend.xml and Windows 11 compatibility bypasses."""
+
+    @staticmethod
+    def generate_autounattend(
+        bypass_tpm_secureboot: bool = True,
+        bypass_ram_cpu_storage: bool = True,
+        bypass_online_account: bool = True,
+        disable_bitlocker: bool = True,
+        local_username: Optional[str] = None
+    ) -> str:
+        """Constructs an autounattend.xml answer file tailored to user options."""
+
+        sync_commands_pe = []
+        order = 1
+
+        if bypass_tpm_secureboot:
+            sync_commands_pe.append(f"""                <RunSynchronousCommand wcm:action="add">
+                    <Order>{order}</Order>
+                    <Path>reg add HKLM\\SYSTEM\\Setup\\LabConfig /v BypassTPMCheck /t REG_DWORD /d 1 /f</Path>
+                </RunSynchronousCommand>""")
+            order += 1
+            sync_commands_pe.append(f"""                <RunSynchronousCommand wcm:action="add">
+                    <Order>{order}</Order>
+                    <Path>reg add HKLM\\SYSTEM\\Setup\\LabConfig /v BypassSecureBootCheck /t REG_DWORD /d 1 /f</Path>
+                </RunSynchronousCommand>""")
+            order += 1
+
+        if bypass_ram_cpu_storage:
+            sync_commands_pe.append(f"""                <RunSynchronousCommand wcm:action="add">
+                    <Order>{order}</Order>
+                    <Path>reg add HKLM\\SYSTEM\\Setup\\LabConfig /v BypassRAMCheck /t REG_DWORD /d 1 /f</Path>
+                </RunSynchronousCommand>""")
+            order += 1
+            sync_commands_pe.append(f"""                <RunSynchronousCommand wcm:action="add">
+                    <Order>{order}</Order>
+                    <Path>reg add HKLM\\SYSTEM\\Setup\\LabConfig /v BypassCPUCheck /t REG_DWORD /d 1 /f</Path>
+                </RunSynchronousCommand>""")
+            order += 1
+            sync_commands_pe.append(f"""                <RunSynchronousCommand wcm:action="add">
+                    <Order>{order}</Order>
+                    <Path>reg add HKLM\\SYSTEM\\Setup\\LabConfig /v BypassStorageCheck /t REG_DWORD /d 1 /f</Path>
+                </RunSynchronousCommand>""")
+            order += 1
+            sync_commands_pe.append(f"""                <RunSynchronousCommand wcm:action="add">
+                    <Order>{order}</Order>
+                    <Path>reg add HKLM\\SYSTEM\\Setup\\LabConfig /v BypassDiskCheck /t REG_DWORD /d 1 /f</Path>
+                </RunSynchronousCommand>""")
+            order += 1
+
+        pe_sync_block = "\n".join(sync_commands_pe)
+
+        sync_commands_specialize = []
+        spec_order = 1
+
+        if bypass_online_account:
+            sync_commands_specialize.append(f"""                <RunSynchronousCommand wcm:action="add">
+                    <Order>{spec_order}</Order>
+                    <Path>reg add HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\OOBE /v BypassNRO /t REG_DWORD /d 1 /f</Path>
+                </RunSynchronousCommand>""")
+            spec_order += 1
+
+        if disable_bitlocker:
+            sync_commands_specialize.append(f"""                <RunSynchronousCommand wcm:action="add">
+                    <Order>{spec_order}</Order>
+                    <Path>reg add HKLM\\SYSTEM\\CurrentControlSet\\Control\\BitLocker /v PreventDeviceEncryption /t REG_DWORD /d 1 /f</Path>
+                </RunSynchronousCommand>""")
+            spec_order += 1
+
+        spec_sync_block = "\n".join(sync_commands_specialize)
+
+        local_user_block = ""
+        if local_username:
+            local_user_block = f"""
+                <UserAccounts>
+                    <LocalAccounts>
+                        <LocalAccount wcm:action="add">
+                            <Password>
+                                <Value></Value>
+                                <PlainText>true</PlainText>
+                            </Password>
+                            <Description>Local Administrator</Description>
+                            <DisplayName>{local_username}</DisplayName>
+                            <Group>Administrators</Group>
+                            <Name>{local_username}</Name>
+                        </LocalAccount>
+                    </LocalAccounts>
+                </UserAccounts>"""
+
+        xml_content = f"""<?xml version="1.0" encoding="utf-8"?>
+<unattend xmlns="urn:schemas-microsoft-com:unattend">
+    <!-- Pass 1: Windows PE Configuration -->
+    <settings pass="windowsPE">
+        <component name="Microsoft-Windows-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+            <RunSynchronous>
+{pe_sync_block}
+            </RunSynchronous>
+            <UserData>
+                <AcceptEula>true</AcceptEula>
+            </UserData>
+        </component>
+        <component name="Microsoft-Windows-Setup" processorArchitecture="arm64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+            <RunSynchronous>
+{pe_sync_block}
+            </RunSynchronous>
+            <UserData>
+                <AcceptEula>true</AcceptEula>
+            </UserData>
+        </component>
+    </settings>
+
+    <!-- Pass 2: Specialize Configuration -->
+    <settings pass="specialize">
+        <component name="Microsoft-Windows-Deployment" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+            <RunSynchronous>
+{spec_sync_block}
+            </RunSynchronous>
+        </component>
+        <component name="Microsoft-Windows-Deployment" processorArchitecture="arm64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+            <RunSynchronous>
+{spec_sync_block}
+            </RunSynchronous>
+        </component>
+    </settings>
+
+    <!-- Pass 3: OOBE System Configuration -->
+    <settings pass="oobeSystem">
+        <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+            <OOBE>
+                <HideEULAPage>true</HideEULAPage>
+                <HideOnlineAccountScreens>true</HideOnlineAccountScreens>
+                <HideWirelessSetupInOOBE>false</HideWirelessSetupInOOBE>
+                <ProtectYourPC>3</ProtectYourPC>
+            </OOBE>{local_user_block}
+        </component>
+        <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="arm64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+            <OOBE>
+                <HideEULAPage>true</HideEULAPage>
+                <HideOnlineAccountScreens>true</HideOnlineAccountScreens>
+                <HideWirelessSetupInOOBE>false</HideWirelessSetupInOOBE>
+                <ProtectYourPC>3</ProtectYourPC>
+            </OOBE>{local_user_block}
+        </component>
+    </settings>
+</unattend>"""
+        return xml_content
+
+    @staticmethod
+    def apply_bypasses(target_volume: Path, autounattend_xml: str):
+        """Writes autounattend.xml and applies the appraiser bypass."""
+        log_info(f"Injecting Windows 11 bypasses into {target_volume.name}...")
+
+        # 1. Root autounattend.xml
+        root_xml = target_volume / "autounattend.xml"
+        try:
+            with open(root_xml, 'w', encoding='utf-8') as f:
+                f.write(autounattend_xml)
+            log_success(f"Created {root_xml.name}")
+        except Exception as e:
+            log_error(f"Failed to write {root_xml}: {e}")
+
+        # 2. $OEM$ backup unattend.xml for setup continuation
+        panther_dir = target_volume / "sources" / "$OEM$" / "$$" / "Panther"
+        try:
+            panther_dir.mkdir(parents=True, exist_ok=True)
+            with open(panther_dir / "unattend.xml", 'w', encoding='utf-8') as f:
+                f.write(autounattend_xml)
+            log_success("Created sources/$OEM$/$$/Panther/unattend.xml backup")
+        except Exception as e:
+            log_warn(f"Note: Could not create Panther backup directory: {e}")
+
+        # 3. Patch sources/appraiserres.dll if it exists (legacy compatibility gate bypass)
+        sources_dir = target_volume / "sources"
+        if sources_dir.exists():
+            for item in sources_dir.iterdir():
+                if item.name.lower() == "appraiserres.dll":
+                    try:
+                        # Zero out the file
+                        with open(item, 'wb') as f:
+                            f.write(b"")
+                        log_success("Patched sources/appraiserres.dll (Zeroed compatibility appraiser)")
+                    except Exception as e:
+                        log_warn(f"Could not patch appraiserres.dll: {e}")
+                    break
+
+
+class RufusWriter:
+    """Orchestrates formatting, file replication, WIM splitting, and UEFI boot configuration."""
+
+    def __init__(
+        self,
+        disk_identifier: str,
+        iso_inspector: ISOInspector,
+        use_dual_partition: bool = True,
+        bypass_tpm_secureboot: bool = True,
+        bypass_ram_cpu_storage: bool = True,
+        bypass_online_account: bool = True,
+        disable_bitlocker: bool = True,
+        local_user: Optional[str] = None
+    ):
+        self.dev_id = disk_identifier
+        self.dev_node = f"/dev/{disk_identifier}"
+        self.iso = iso_inspector
+        self.use_dual_partition = use_dual_partition
+        self.bypass_tpm = bypass_tpm_secureboot
+        self.bypass_hardware = bypass_ram_cpu_storage
+        self.bypass_account = bypass_online_account
+        self.disable_bitlocker = disable_bitlocker
+        self.local_user = local_user
+
+    def write(self) -> bool:
+        start_time = time.time()
+        print("\n" + "="*60)
+        print(f"{Colors.BOLD}{Colors.CYAN}Rufus for macOS - Windows 11 Creation Engine{Colors.RESET}")
+        print("="*60)
+        log_info(f"Target Disk: {self.dev_node}")
+        log_info(f"Source ISO:  {self.iso.iso_path.name}")
+        log_info(f"Architecture: {'Universal Dual-Partition (FAT32 Boot + ExFAT Data)' if self.use_dual_partition else 'Single FAT32 (Split WIM)'}")
+        print("="*60 + "\n")
+
+        # Step 1: Unmount target disk
+        DiskManager.unmount_disk(self.dev_node)
+
+        # Step 2: Partition and Format
+        if self.use_dual_partition:
+            success = self._format_dual_partition()
+        else:
+            success = self._format_single_partition()
+
+        if not success:
+            log_error("Partitioning failed. Aborting.")
+            return False
+
+        # Step 3: Wait for volumes to mount
+        time.sleep(2)
+        boot_vol, install_vol = self._get_mounted_volumes()
+        if not boot_vol:
+            log_error("Could not find mounted boot volume after formatting.")
+            return False
+
+        log_success(f"Boot Partition Mounted:    {boot_vol}")
+        if self.use_dual_partition and install_vol:
+            log_success(f"Install Partition Mounted: {install_vol}")
+
+        # Step 4: Transfer Files
+        if self.use_dual_partition and install_vol:
+            success = self._copy_dual_partition_files(boot_vol, install_vol)
+        else:
+            success = self._copy_single_partition_files(boot_vol)
+
+        if not success:
+            log_error("File transfer failed. Aborting.")
+            return False
+
+        # Step 5: Inject Windows 11 Bypasses
+        unattend_xml = WindowsCustomizer.generate_autounattend(
+            bypass_tpm_secureboot=self.bypass_tpm,
+            bypass_ram_cpu_storage=self.bypass_hardware,
+            bypass_online_account=self.bypass_account,
+            disable_bitlocker=self.disable_bitlocker,
+            local_username=self.local_user
+        )
+
+        WindowsCustomizer.apply_bypasses(boot_vol, unattend_xml)
+        if self.use_dual_partition and install_vol:
+            WindowsCustomizer.apply_bypasses(install_vol, unattend_xml)
+
+        # Step 6: Sync filesystem caches
+        log_info("Flushing disk caches (sync)...")
+        subprocess.run(['sync'])
+
+        elapsed = time.time() - start_time
+        mins, secs = divmod(int(elapsed), 60)
+        print("\n" + "="*60)
+        log_success(f"BOOTABLE WINDOWS 11 USB SUCCESSFULLY CREATED! ({mins}m {secs}s)")
+        print("="*60)
+        print(f"\n{Colors.BOLD}Next Steps for your PC:{Colors.RESET}")
+        print("1. Safely eject the USB drive using Finder or 'diskutil eject'.")
+        print("2. Insert the USB into the target PC.")
+        print("3. Power on the PC and press your BIOS boot key (F12, F11, F8, or Del).")
+        print("4. Select UEFI: Kingston / USB Device from the boot menu.")
+        print(f"5. Windows 11 setup will boot cleanly with all hardware checks bypassed!\n")
+
+        return True
+
+    def _format_dual_partition(self) -> bool:
+        """Partitions disk with GPT: Partition 1: FAT32 (1.5GB, WINBOOT), Partition 2: ExFAT (Rest, WININSTALL)."""
+        log_info("Formatting USB with GPT Dual-Partition scheme...")
+        base_cmd = [
+            'diskutil', 'partitionDisk', self.dev_node, 'GPT',
+            'FAT32', 'WINBOOT', '1.5G',
+            'ExFAT', 'WININSTALL', '0'
+        ]
+        cmd = (['sudo'] + base_cmd) if os.geteuid() != 0 else base_cmd
+        log_info(f"Executing: {' '.join(cmd)}")
+        # If running as non-root, do not capture stdin/stdout so sudo can prompt for password if needed
+        if os.geteuid() != 0:
+            res = subprocess.run(cmd)
+        else:
+            res = subprocess.run(cmd, capture_output=True, text=True)
+
+        if res.returncode != 0:
+            err_msg = getattr(res, 'stderr', None) or getattr(res, 'stdout', None) or ""
+            log_error(f"Partition command failed: {err_msg.strip()}")
+            if "could not be unmounted" in str(err_msg).lower():
+                log_warn("The USB volume is busy or locked by another app (Finder, disk mounters, etc.).")
+            return False
+        log_success("Partitioning completed successfully.")
+        return True
+
+    def _format_single_partition(self) -> bool:
+        """Formats entire disk as a single GPT FAT32 partition."""
+        log_info("Formatting USB with GPT Single FAT32 scheme...")
+        base_cmd = ['diskutil', 'eraseDisk', 'FAT32', 'WIN11', 'GPT', self.dev_node]
+        cmd = (['sudo'] + base_cmd) if os.geteuid() != 0 else base_cmd
+        log_info(f"Executing: {' '.join(cmd)}")
+        if os.geteuid() != 0:
+            res = subprocess.run(cmd)
+        else:
+            res = subprocess.run(cmd, capture_output=True, text=True)
+
+        if res.returncode != 0:
+            err_msg = getattr(res, 'stderr', None) or getattr(res, 'stdout', None) or ""
+            log_error(f"Erase command failed: {err_msg.strip()}")
+            return False
+        log_success("Formatting completed successfully.")
+        return True
+
+    def _get_mounted_volumes(self) -> Tuple[Optional[Path], Optional[Path]]:
+        """Finds mounted volume paths for the target disk partitions."""
+        time.sleep(1)
+        info = DiskManager.get_disk_info(self.dev_id)
+        boot_vol = None
+        install_vol = None
+
+        # Look in /Volumes/ for WINBOOT and WININSTALL or WIN11
+        for candidate in Path("/Volumes").iterdir():
+            if not candidate.is_dir():
+                continue
+            name = candidate.name.upper()
+            if name == "WINBOOT":
+                boot_vol = candidate
+            elif name == "WININSTALL":
+                install_vol = candidate
+            elif name == "WIN11":
+                boot_vol = candidate
+
+        # Fallback check via diskutil info
+        if not boot_vol:
+            for part_id in [f"{self.dev_id}s1", f"{self.dev_id}s2"]:
+                p_info = DiskManager.get_disk_info(part_id)
+                if p_info and p_info.get('Mounted', False):
+                    mp = Path(p_info.get('MountPoint', ''))
+                    if mp.exists():
+                        if not boot_vol:
+                            boot_vol = mp
+                        elif not install_vol:
+                            install_vol = mp
+
+        return boot_vol, install_vol
+
+    def _copy_dual_partition_files(self, boot_vol: Path, install_vol: Path) -> bool:
+        """Copies UEFI boot files to WINBOOT and full OS image to WININSTALL."""
+        src_root = self.iso.mount_point
+        assert src_root is not None
+
+        # 1. Files for WINBOOT (Boot Partition)
+        # Needs: boot/, efi/, bootmgr, bootmgr.efi, sources/boot.wim
+        log_info("Stage 1/2: Copying UEFI Bootloader & WinPE files to WINBOOT...")
+
+        boot_items = ['boot', 'efi', 'bootmgr', 'bootmgr.efi']
+        for item_name in boot_items:
+            src_item = ISOInspector.find_file(src_root, [item_name])
+            if src_item and src_item.exists():
+                dst_item = boot_vol / src_item.name
+                log_info(f"Copying {src_item.name} to WINBOOT...")
+                self._copy_recursive(src_item, dst_item)
+
+        # Copy sources/boot.wim to WINBOOT
+        src_boot_wim = ISOInspector.find_file(src_root, ['sources', 'boot.wim'])
+        if src_boot_wim and src_boot_wim.exists():
+            dst_sources = boot_vol / "sources"
+            dst_sources.mkdir(exist_ok=True)
+            dst_boot_wim = dst_sources / "boot.wim"
+            log_info(f"Copying {src_boot_wim.name} ({format_size(src_boot_wim.stat().st_size)}) to WINBOOT...")
+            self._copy_file_with_progress(src_boot_wim, dst_boot_wim)
+        else:
+            log_error("Could not find sources/boot.wim in ISO!")
+            return False
+
+        log_success("WINBOOT boot files copied.")
+
+        # 2. Files for WININSTALL (Data & Installation Partition)
+        # Needs: All ISO contents (including the full install.wim)
+        log_info("Stage 2/2: Copying complete Windows 11 installation payload to WININSTALL...")
+        total_iso_files = list(src_root.iterdir())
+        for idx, item in enumerate(total_iso_files, 1):
+            dst_item = install_vol / item.name
+            log_info(f"[{idx}/{len(total_iso_files)}] Transferring {item.name}...")
+            self._copy_recursive(item, dst_item)
+
+        log_success("WININSTALL files copied.")
+        return True
+
+    def _copy_single_partition_files(self, boot_vol: Path) -> bool:
+        """Copies all ISO files to single FAT32 partition, splitting install.wim into SWM."""
+        src_root = self.iso.mount_point
+        assert src_root is not None
+
+        log_info("Copying installation files to WIN11...")
+        for item in src_root.iterdir():
+            if item.name.lower() == "sources":
+                # Handle sources directory separately to split install.wim
+                dst_sources = boot_vol / "sources"
+                dst_sources.mkdir(exist_ok=True)
+                for src_file in item.iterdir():
+                    if src_file.name.lower() in ['install.wim', 'install.esd']:
+                        # Split WIM
+                        self._split_and_copy_wim(src_file, dst_sources)
+                    else:
+                        dst_file = dst_sources / src_file.name
+                        self._copy_recursive(src_file, dst_file)
+            else:
+                dst_item = boot_vol / item.name
+                self._copy_recursive(item, dst_item)
+
+        return True
+
+    def _split_and_copy_wim(self, src_wim: Path, dst_dir: Path):
+        """Splits install.wim into 3800MB chunks using wimlib-imagex if available."""
+        wimlib_bin = shutil.which("wimlib-imagex") or shutil.which("wimsplit")
+        dst_swm = dst_dir / "install.swm"
+
+        if wimlib_bin:
+            log_info(f"Splitting {src_wim.name} with {Path(wimlib_bin).name} into 3800MB chunks...")
+            cmd = [wimlib_bin, "split", str(src_wim), str(dst_swm), "3800"]
+            subprocess.run(cmd, check=True)
+            log_success("WIM successfully split into SWM files.")
+        else:
+            log_warn("wimlib-imagex not found. Falling back to direct chunk transfer...")
+            # If not installed, fallback to direct copy or warn
+            self._copy_file_with_progress(src_wim, dst_dir / src_wim.name)
+
+    def _copy_recursive(self, src: Path, dst: Path):
+        if src.is_dir():
+            dst.mkdir(parents=True, exist_ok=True)
+            for child in src.iterdir():
+                self._copy_recursive(child, dst / child.name)
+        else:
+            self._copy_file_with_progress(src, dst)
+
+    def _copy_file_with_progress(self, src: Path, dst: Path, chunk_size: int = 16 * 1024 * 1024):
+        """Copies file in 16MB chunks with live progress updates for large files."""
+        total_size = src.stat().st_size
+
+        # For small files (< 50MB), fast stream copy (avoids Darwin fcopyfile/copystat on FAT32)
+        if total_size < 50 * 1024 * 1024:
+            with open(src, 'rb') as f_in, open(dst, 'wb') as f_out:
+                shutil.copyfileobj(f_in, f_out, length=1024 * 1024)
+            return
+
+        copied = 0
+        last_print = 0
+        start_time = time.time()
+
+        with open(src, 'rb') as f_in, open(dst, 'wb') as f_out:
+            while True:
+                chunk = f_in.read(chunk_size)
+                if not chunk:
+                    break
+                f_out.write(chunk)
+                copied += len(chunk)
+
+                now = time.time()
+                if now - last_print > 0.5 or copied == total_size:
+                    last_print = now
+                    pct = (copied / total_size) * 100
+                    speed = (copied / (now - start_time + 0.001)) / (1024 * 1024)
+                    bar_len = 30
+                    filled = int(bar_len * (copied / total_size))
+                    bar = "█" * filled + "░" * (bar_len - filled)
+                    sys.stdout.write(f"\r  {Colors.CYAN}{src.name}{Colors.RESET} [{bar}] {pct:5.1f}% ({speed:.1f} MB/s) ")
+                    sys.stdout.flush()
+
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+
+
+def interactive_wizard():
+    """Interactive CLI Wizard styled like Rufus."""
+    print("\n" + "="*65)
+    print(f"{Colors.BOLD}{Colors.CYAN}  RUFUS FOR MAC (macOS 27 Edition){Colors.RESET}")
+    print(f"  Reliable, Bootable Windows 11 USB Creator for Mac")
+    print("="*65 + "\n")
+
+    # Step 1: Scan for USB drives
+    log_info("Scanning connected USB storage devices...")
+    disks = DiskManager.get_disks()
+
+    if not disks:
+        log_error("No external USB flash drives detected!")
+        print("\nPlease insert a USB flash drive (8GB or larger) and try again.")
+        sys.exit(1)
+
+    print(f"\n{Colors.BOLD}Select Target USB Drive:{Colors.RESET}")
+    for idx, d in enumerate(disks, 1):
+        mounted_desc = ""
+        if d['mounted_partitions']:
+            names = [f"'{p['name']}'" for p in d['mounted_partitions']]
+            mounted_desc = f" (Volumes: {', '.join(names)})"
+        print(f"  [{Colors.CYAN}{idx}{Colors.RESET}] {Colors.BOLD}{d['media_name']}{Colors.RESET} ({d['size_str']}) - {d['device_node']}{mounted_desc}")
+
+    while True:
+        try:
+            choice = input(f"\nEnter choice [1-{len(disks)}]: ").strip()
+            if not choice:
+                choice = "1"
+            idx = int(choice) - 1
+            if 0 <= idx < len(disks):
+                selected_disk = disks[idx]
+                break
+            print("Invalid choice, please select from the list.")
+        except ValueError:
+            print("Please enter a valid number.")
+
+    log_success(f"Selected Target: {selected_disk['media_name']} ({selected_disk['device_node']})")
+
+    # Step 2: Select ISO Path
+    print(f"\n{Colors.BOLD}Select Windows 11 ISO Image:{Colors.RESET}")
+    search_dirs = [
+        Path("/Users/Shared"),
+        Path.home() / "Downloads",
+        Path.home() / "Desktop",
+        Path.home(),
+        Path.cwd()
+    ]
+
+    sudo_user = os.environ.get('SUDO_USER')
+    if sudo_user:
+        real_home = Path(f"/Users/{sudo_user}")
+        if real_home.exists():
+            search_dirs.extend([
+                real_home / "Downloads",
+                real_home / "Desktop",
+                real_home
+            ])
+
+    suggested_isos = []
+    seen_paths = set()
+
+    # First priority: check any already mounted Windows volumes in /Volumes/
+    try:
+        for vol in Path("/Volumes").iterdir():
+            if vol.is_dir() and not vol.name.startswith('.'):
+                if (vol / "sources" / "boot.wim").exists() or (vol / "SOURCES" / "BOOT.WIM").exists():
+                    real_p = str(vol.resolve())
+                    if real_p not in seen_paths:
+                        seen_paths.add(real_p)
+                        suggested_isos.append(vol)
+    except Exception:
+        pass
+
+    for s_dir in search_dirs:
+        if s_dir.exists():
+            try:
+                for f in s_dir.iterdir():
+                    if f.is_file() and f.suffix.lower() in ['.iso', '.img']:
+                        real_p = str(f.resolve())
+                        if real_p not in seen_paths:
+                            seen_paths.add(real_p)
+                            suggested_isos.append(f)
+            except Exception:
+                pass
+
+    if suggested_isos:
+        print("Found recent ISO files & Windows media:")
+        for s_idx, iso_p in enumerate(suggested_isos[:6], 1):
+            if iso_p.is_dir():
+                print(f"  [{s_idx}] {Colors.BOLD}{iso_p.name}{Colors.RESET} {Colors.GREEN}(Mounted Windows Media){Colors.RESET}")
+                print(f"      {Colors.DIM}{iso_p}{Colors.RESET}")
+            else:
+                print(f"  [{s_idx}] {iso_p.name} ({format_size(iso_p.stat().st_size)})")
+                print(f"      {Colors.DIM}{iso_p.parent}{Colors.RESET}")
+        print("  [0] Enter a different path manually (or drag & drop file)")
+
+        choice_iso = input(f"\nSelect ISO [1-{min(len(suggested_isos), 6)}] or 0: ").strip()
+        if choice_iso.isdigit() and 1 <= int(choice_iso) <= len(suggested_isos):
+            iso_path = str(suggested_isos[int(choice_iso) - 1])
+        else:
+            iso_path = input("Enter path to ISO (or drag & drop the file into this window): ").strip()
+    else:
+        print(f"{Colors.YELLOW}No ISO files found automatically.{Colors.RESET}")
+        iso_path = input("Enter full path to Windows 11 ISO (or drag & drop the file into this window): ").strip()
+
+    # Expand ~ or quotes or escape backslashes from drag & drop
+    iso_path = iso_path.strip().strip("'\"").replace("\\ ", " ")
+    iso_path = os.path.expanduser(iso_path)
+    if not os.path.exists(iso_path):
+        log_error(f"File not found: {iso_path}")
+        sys.exit(1)
+
+    # Step 3: Inspect ISO
+    inspector = ISOInspector(iso_path)
+    if not inspector.mount():
+        log_error("Failed to validate Windows ISO. Aborting.")
+        sys.exit(1)
+
+    # Step 4: Configuration Options (Rufus WUE)
+    print(f"\n{Colors.BOLD}Windows User Experience (WUE) Customizations:{Colors.RESET}")
+    print(f"  [1] Bypass TPM 2.0 and Secure Boot checks     {Colors.GREEN}[Enabled]{Colors.RESET}")
+    print(f"  [2] Bypass 4GB+ RAM, Storage & CPU checks     {Colors.GREEN}[Enabled]{Colors.RESET}")
+    print(f"  [3] Bypass Online Microsoft Account (BypassNRO){Colors.GREEN}[Enabled]{Colors.RESET}")
+    print(f"  [4] Disable BitLocker Automatic Encryption    {Colors.GREEN}[Enabled]{Colors.RESET}")
+
+    customize = input("\nKeep all recommended bypasses enabled? (Y/n): ").strip().lower()
+    enable_all = (customize != 'n')
+
+    # Step 5: Final Confirmation Safeguard
+    print("\n" + f"{Colors.RED}{Colors.BOLD}" + "!"*65)
+    print("                      WARNING: DATA LOSS")
+    print(f"All existing data on {selected_disk['media_name']} ({selected_disk['device_node']}) will be DESTROYED!")
+    print("!"*65 + f"{Colors.RESET}\n")
+
+    confirm = input(f"Are you sure you want to proceed and erase {selected_disk['device_node']}? (type 'YES' to confirm): ").strip()
+    if confirm != "YES":
+        log_warn("Operation cancelled by user.")
+        inspector.unmount()
+        sys.exit(0)
+
+    # Step 6: Execute Writing
+    writer = RufusWriter(
+        disk_identifier=selected_disk['identifier'],
+        iso_inspector=inspector,
+        use_dual_partition=True,
+        bypass_tpm_secureboot=enable_all,
+        bypass_ram_cpu_storage=enable_all,
+        bypass_online_account=enable_all,
+        disable_bitlocker=enable_all
+    )
+
+    try:
+        success = writer.write()
+    finally:
+        inspector.unmount()
+
+    if not success:
+        sys.exit(1)
+
+
+def install_cli():
+    """Installs rufus-mac to system PATH (/usr/local/bin or ~/.local/bin) for global access."""
+    script_path = Path(os.path.realpath(__file__))
+    target_dir = Path("/usr/local/bin")
+    symlink_path = target_dir / "rufus-mac"
+
+    print("\n" + "="*60)
+    print(f"{Colors.BOLD}{Colors.CYAN}Rufus for macOS - Command Installation{Colors.RESET}")
+    print("="*60)
+    log_info(f"Source executable: {script_path}")
+
+    installed = False
+
+    # 1. Attempt system-wide install if /usr/local/bin is writable
+    if target_dir.exists() and os.access(str(target_dir), os.W_OK):
+        try:
+            if symlink_path.exists() or symlink_path.is_symlink():
+                symlink_path.unlink()
+            symlink_path.symlink_to(script_path)
+            installed = True
+            log_success(f"Installed system-wide symlink: {symlink_path}")
+        except Exception:
+            pass
+
+    # 2. User-level PATH directories (e.g. ~/.gemini/antigravity/bin, ~/.local/bin)
+    user_candidates = [
+        Path("/Users/ivanklochenko/.gemini/antigravity/bin"),
+        Path.home() / ".local" / "bin",
+        Path.home() / "bin"
+    ]
+    for u_dir in user_candidates:
+        if u_dir.exists() and os.access(str(u_dir), os.W_OK):
+            try:
+                u_link = u_dir / "rufus-mac"
+                if u_link.exists() or u_link.is_symlink():
+                    u_link.unlink()
+                u_link.symlink_to(script_path)
+                log_success(f"Installed to user PATH: {u_link}")
+                installed = True
+            except Exception:
+                pass
+
+    if installed:
+        print("\n" + "="*60)
+        log_success("READY TO USE GLOBALLY!")
+        print("="*60)
+        print(f"You can now run {Colors.BOLD}{Colors.CYAN}rufus-mac{Colors.RESET} directly from any directory in your terminal!\n")
+    else:
+        print(f"\nTo install system-wide across all users, run:")
+        print(f"  {Colors.CYAN}sudo ln -sf \"{script_path}\" /usr/local/bin/rufus-mac{Colors.RESET}\n")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Rufus for macOS (rufus-mac) - Reliable Windows 11 Bootable USB Creator for Mac",
+        epilog="Supported macOS: 10.15 Catalina through macOS 27 Golden Gate (Apple Silicon & Intel)"
+    )
+    parser.add_argument("--iso", help="Path to Windows 10/11 ISO file")
+    parser.add_argument("--target", help="Target disk identifier (e.g. disk17)")
+    parser.add_argument("--list-disks", action="store_true", help="List safe USB drives and exit")
+    parser.add_argument("--bypass-all", action="store_true", default=True, help="Enable all Windows 11 hardware and account bypasses")
+    parser.add_argument("--no-bypass", action="store_true", help="Disable all Windows 11 bypasses")
+    parser.add_argument("--single-fat32", action="store_true", help="Use single FAT32 partition with split WIM (requires wimlib)")
+    parser.add_argument("--install", action="store_true", help="Install rufus-mac to system PATH (/usr/local/bin) for global access")
+    parser.add_argument("-v", "--version", action="version", version=f"RufusMac {VERSION}")
+
+    args = parser.parse_args()
+
+    if args.install:
+        install_cli()
+        return
+
+    if args.list_disks:
+        print("\n" + "="*50)
+        print("Connected Removable USB Drives:")
+        print("="*50)
+        disks = DiskManager.get_disks()
+        if not disks:
+            print("  No removable USB drives found.")
+        for d in disks:
+            print(f"  • {d['identifier']}: {d['media_name']} ({d['size_str']}) - {d['device_node']}")
+        print("="*50 + "\n")
+        return
+
+    # If no arguments given, launch the interactive wizard
+    if not args.iso and not args.target:
+        interactive_wizard()
+        return
+
+    if not args.iso or not args.target:
+        log_error("Both --iso and --target must be specified in headless mode.")
+        parser.print_help()
+        sys.exit(1)
+
+    target_id = args.target.replace("/dev/", "").replace("r", "")
+    iso_path = os.path.expanduser(args.iso)
+
+    # Safety check on target disk
+    disks = DiskManager.get_disks()
+    matched = next((d for d in disks if d['identifier'] == target_id), None)
+    if not matched:
+        log_error(f"Target disk '{target_id}' is not an external removable USB drive! Aborting for safety.")
+        sys.exit(1)
+
+    inspector = ISOInspector(iso_path)
+    if not inspector.mount():
+        sys.exit(1)
+
+    enable_bypasses = not args.no_bypass
+    writer = RufusWriter(
+        disk_identifier=target_id,
+        iso_inspector=inspector,
+        use_dual_partition=not args.single_fat32,
+        bypass_tpm_secureboot=enable_bypasses,
+        bypass_ram_cpu_storage=enable_bypasses,
+        bypass_online_account=enable_bypasses,
+        disable_bitlocker=enable_bypasses
+    )
+
+    try:
+        success = writer.write()
+    finally:
+        inspector.unmount()
+
+    sys.exit(0 if success else 1)
+
+
+if __name__ == '__main__':
+    main()

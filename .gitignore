@@ -1,0 +1,36 @@
+# macOS metadata
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+
+# Build caches & App bundles
+.build_cache/
+*.app/
+*.dSYM/
+build/
+dist/
+
+# Disk Images & ISOs (never commit large binary installers)
+*.iso
+*.ISO
+*.img
+*.dmg
+*.wim
+*.swm
+
+# Local scratch / test logs
+*.log
+scratch/
