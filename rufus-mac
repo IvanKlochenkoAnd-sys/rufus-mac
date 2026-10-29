@@ -1098,7 +1098,7 @@ def install_cli():
 
     # 2. User-level PATH directories (e.g. ~/.gemini/antigravity/bin, ~/.local/bin)
     user_candidates = [
-        Path("/Users/ivanklochenko/.gemini/antigravity/bin"),
+        Path.home() / ".gemini" / "antigravity" / "bin",
         Path.home() / ".local" / "bin",
         Path.home() / "bin"
     ]
