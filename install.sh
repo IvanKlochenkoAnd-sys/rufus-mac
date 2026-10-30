@@ -6,7 +6,7 @@
 
 set -e
 
-REPO_URL="https://raw.githubusercontent.com/ivanklochenko/rufus-mac/main/rufus-mac"
+REPO_URL="https://raw.githubusercontent.com/IvanKlochenkoAnd-sys/rufus-mac/main/rufus-mac"
 INSTALL_DIR="/usr/local/bin"
 TARGET_BIN="${INSTALL_DIR}/rufus-mac"
 

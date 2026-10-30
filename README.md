@@ -37,13 +37,13 @@ Enter choice [1-1]: 1
 Run the one-line installer in Terminal:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ivanklochenko/rufus-mac/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/IvanKlochenkoAnd-sys/rufus-mac/main/install.sh | bash
 ```
 
 *Or install from source:*
 
 ```bash
-git clone https://github.com/ivanklochenko/rufus-mac.git
+git clone https://github.com/IvanKlochenkoAnd-sys/rufus-mac.git
 cd rufus-mac
 ./rufus-mac --install
 ```
