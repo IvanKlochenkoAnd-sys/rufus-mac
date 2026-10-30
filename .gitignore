@@ -34,3 +34,4 @@ dist/
 # Local scratch / test logs
 *.log
 scratch/
+legacy-ios-kit
