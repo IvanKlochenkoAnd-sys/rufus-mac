@@ -29,7 +29,8 @@ import argparse
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 
-VERSION = "1.1.0"
+VERSION = "0.2.0-alpha"
+DISPLAY_VERSION = "Alpha 0.2"
 
 # ANSI Terminal Colors
 class Colors:
@@ -190,6 +191,9 @@ class ISOInspector:
         self.mount_point: Optional[Path] = None
         self.attached_dev: Optional[str] = None
         self.is_windows = False
+        self.os_type = "unknown"
+        self.os_name = "Unknown Payload"
+        self.file_size = self.iso_path.stat().st_size if self.iso_path.exists() and self.iso_path.is_file() else 0
         self.has_uefi = False
         self.has_boot_wim = False
         self.install_wim_path: Optional[Path] = None
@@ -237,6 +241,13 @@ class ISOInspector:
         if not self.iso_path.exists():
             log_error(f"ISO file or directory does not exist: {self.iso_path}")
             return False
+
+        # If user specified a raw disk image file (.img, .raw, .bin, .dmg)
+        if self.iso_path.is_file() and self.iso_path.suffix.lower() in ['.img', '.raw', '.bin', '.dmg']:
+            self.os_type = "raw_image"
+            self.os_name = f"Raw Disk Image ({self.iso_path.suffix.upper()})"
+            log_success(f"Detected {self.os_name}: {self.iso_path.name}")
+            return True
 
         # If user directly specified an already mounted volume (e.g. /Volumes/CCCOMA_...)
         if self.iso_path.is_dir():
@@ -383,17 +394,42 @@ class ISOInspector:
 
         self.is_windows = bool(self.has_boot_wim and self.install_wim_path)
 
-        if not self.is_windows:
-            log_warn("The selected image does not appear to be a standard Windows installation media.")
-            return False
+        if self.is_windows:
+            self.os_type = "windows"
+            self.os_name = "Windows 11 / 10 UEFI Setup"
+            wim_name = self.install_wim_path.name if self.install_wim_path else "install.wim"
+            log_success(f"Detected OS: {self.os_name}")
+            log_info(f"UEFI Bootloader: {'Present (x64/ARM64)' if self.has_uefi else 'Missing'}")
+            log_info(f"OS Payload: {wim_name} ({format_size(self.install_wim_size)})")
+            if self.is_wim_large:
+                log_warn(f"{wim_name} exceeds the 4GB FAT32 limit! Automatic dual-partition UEFI mode will be utilized.")
+            return True
 
-        wim_name = self.install_wim_path.name if self.install_wim_path else "None"
-        log_success(f"Valid Windows image verified.")
-        log_info(f"UEFI Bootloader: {'Present (x64/ARM64)' if self.has_uefi else 'Missing'}")
-        log_info(f"OS Payload: {wim_name} ({format_size(self.install_wim_size)})")
-        if self.is_wim_large:
-            log_warn(f"{wim_name} exceeds the 4GB FAT32 limit! Automatic dual-partition UEFI mode will be utilized.")
+        # Check Linux distribution signatures
+        if self.find_file(self.mount_point, ['casper']):
+            self.os_type = "linux"
+            self.os_name = "Ubuntu / Linux Mint Live (Hybrid ISO)"
+        elif self.find_file(self.mount_point, ['live']):
+            self.os_type = "linux"
+            self.os_name = "Debian / Kali Linux Live (Hybrid ISO)"
+        elif self.find_file(self.mount_point, ['arch']):
+            self.os_type = "linux"
+            self.os_name = "Arch Linux Live (Hybrid ISO)"
+        elif self.find_file(self.mount_point, ['images', 'pxeboot']) or self.find_file(self.mount_point, ['LiveOS']):
+            self.os_type = "linux"
+            self.os_name = "Fedora / Red Hat Linux Live (Hybrid ISO)"
+        elif (self.find_file(self.mount_point, ['isolinux']) or
+              self.find_file(self.mount_point, ['boot', 'grub']) or
+              self.find_file(self.mount_point, ['syslinux'])):
+            self.os_type = "linux"
+            self.os_name = "Linux Live / Installer (Hybrid ISO)"
+        else:
+            self.os_type = "hybrid"
+            self.os_name = "Bootable Hybrid ISO / Image"
 
+        log_success(f"Detected OS: {self.os_name}")
+        log_info(f"UEFI Bootloader: {'Present' if self.has_uefi else 'BIOS / Hybrid'}")
+        log_info("Flashing Mode: High-Speed Native Block Stream (DD Mode)")
         return True
 
     @staticmethod
@@ -621,7 +657,8 @@ class RufusWriter:
         bypass_ram_cpu_storage: bool = True,
         bypass_online_account: bool = True,
         disable_bitlocker: bool = True,
-        local_user: Optional[str] = None
+        local_user: Optional[str] = None,
+        force_raw: bool = False
     ):
         self.dev_id = disk_identifier
         self.dev_node = f"/dev/{disk_identifier}"
@@ -632,8 +669,15 @@ class RufusWriter:
         self.bypass_account = bypass_online_account
         self.disable_bitlocker = disable_bitlocker
         self.local_user = local_user
+        self.force_raw = force_raw
 
     def write(self) -> bool:
+        if self.force_raw or self.iso.os_type in ["linux", "raw_image", "hybrid"]:
+            return self._write_raw_image()
+        else:
+            return self._write_windows()
+
+    def _write_windows(self) -> bool:
         start_time = time.time()
         print("\n" + "="*60)
         print(f"{Colors.BOLD}{Colors.CYAN}Rufus for macOS - Windows 11 Creation Engine{Colors.RESET}")
@@ -706,6 +750,96 @@ class RufusWriter:
         print("4. Select UEFI: Kingston / USB Device from the boot menu.")
         print(f"5. Windows 11 setup will boot cleanly with all hardware checks bypassed!\n")
 
+        return True
+
+    def _write_raw_image(self) -> bool:
+        """High-speed native unbuffered block writer for Linux hybrid ISOs and raw images."""
+        start_time = time.time()
+        print("\n" + "="*60)
+        print(f"{Colors.BOLD}{Colors.CYAN}Rufus for macOS - Native Block Stream Engine{Colors.RESET}")
+        print("="*60)
+        log_info(f"Target Disk:  {self.dev_node} (Raw node: /dev/r{self.dev_id})")
+        log_info(f"Source Image: {self.iso.iso_path.name} ({format_size(self.iso.file_size)})")
+        log_info(f"Payload Type: {self.iso.os_name}")
+        log_info("Architecture: Direct Hybrid / Native Block Streaming (4MB Blocks)")
+        print("="*60 + "\n")
+
+        # Step 1: Force unmount all partitions on target disk
+        DiskManager.unmount_disk(self.dev_node)
+
+        raw_dev = f"/dev/r{self.dev_id}"
+        total_bytes = self.iso.file_size
+        chunk_size = 4 * 1024 * 1024  # 4 MB chunks for optimal USB bus saturation
+
+        log_info(f"Streaming image payload to {raw_dev}...")
+
+        use_sudo = (os.geteuid() != 0)
+        pipe_proc = None
+
+        try:
+            if use_sudo:
+                cmd = ['sudo', 'dd', f'of={raw_dev}', 'bs=4m']
+                pipe_proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+                out_stream = pipe_proc.stdin
+            else:
+                out_stream = open(raw_dev, "wb")
+
+            copied = 0
+            last_time = time.time()
+            start_copy = last_time
+
+            with open(self.iso.iso_path, "rb") as in_f:
+                while True:
+                    buf = in_f.read(chunk_size)
+                    if not buf:
+                        break
+                    out_stream.write(buf)
+                    copied += len(buf)
+                    now = time.time()
+                    if now - last_time >= 0.5 or copied == total_bytes:
+                        elapsed_total = max(now - start_copy, 0.001)
+                        pct = (copied / total_bytes) * 100 if total_bytes > 0 else 100.0
+                        speed = (copied / elapsed_total) / (1024 * 1024)
+                        rem_sec = (total_bytes - copied) / max(copied / elapsed_total, 1) if total_bytes > copied else 0
+                        m_rem, s_rem = divmod(int(rem_sec), 60)
+                        eta_str = f"{m_rem:02d}:{s_rem:02d}"
+
+                        bar_w = 25
+                        filled = int(bar_w * (copied / total_bytes)) if total_bytes > 0 else bar_w
+                        bar = "█" * filled + "░" * (bar_w - filled)
+                        print(f"\r  [{bar}] {pct:5.1f}% | {format_size(copied)}/{format_size(total_bytes)} | {speed:5.1f} MB/s | ETA: {eta_str}", end="", flush=True)
+                        last_time = now
+
+            print()
+            if use_sudo and pipe_proc:
+                out_stream.close()
+                pipe_proc.wait()
+                if pipe_proc.returncode != 0:
+                    err = pipe_proc.stderr.read().decode('utf-8', errors='ignore') if pipe_proc.stderr else ""
+                    log_error(f"Write operation error: {err}")
+                    return False
+            else:
+                out_stream.flush()
+                os.fsync(out_stream.fileno())
+                out_stream.close()
+
+        except Exception as e:
+            log_error(f"Failed during raw write: {e}")
+            return False
+
+        # Step 2: Flush write caches and eject safely
+        log_info("Flushing disk write buffers (sync)...")
+        subprocess.run(['sync'])
+        time.sleep(1)
+        log_info(f"Ejecting {self.dev_node}...")
+        subprocess.run(['diskutil', 'eject', self.dev_node], capture_output=True)
+
+        elapsed = time.time() - start_time
+        mins, secs = divmod(int(elapsed), 60)
+        print("\n" + "="*60)
+        log_success(f"BOOTABLE USB DRIVE SUCCESSFULLY CREATED! ({mins}m {secs}s)")
+        print("="*60)
+        print(f"Device {self.dev_node} is now ready to boot.\n")
         return True
 
     def _format_dual_partition(self) -> bool:
@@ -914,8 +1048,8 @@ class RufusWriter:
 def interactive_wizard():
     """Interactive CLI Wizard styled like Rufus."""
     print("\n" + "="*65)
-    print(f"{Colors.BOLD}{Colors.CYAN}  RUFUS FOR MAC (macOS 27 Edition){Colors.RESET}")
-    print(f"  Reliable, Bootable Windows 11 USB Creator for Mac")
+    print(f"{Colors.BOLD}{Colors.CYAN}  RUFUS FOR MAC (macOS 27 Edition) - {DISPLAY_VERSION}{Colors.RESET}")
+    print(f"  Universal Multi-OS Bootable USB Creator (Windows 11 & Linux)")
     print("="*65 + "\n")
 
     # Step 1: Scan for USB drives
@@ -950,8 +1084,8 @@ def interactive_wizard():
 
     log_success(f"Selected Target: {selected_disk['media_name']} ({selected_disk['device_node']})")
 
-    # Step 2: Select ISO Path
-    print(f"\n{Colors.BOLD}Select Windows 11 ISO Image:{Colors.RESET}")
+    # Step 2: Select ISO / Image Path
+    print(f"\n{Colors.BOLD}Select OS Image (Windows 11 / Linux / Raw Image):{Colors.RESET}")
     search_dirs = [
         Path("/Users/Shared"),
         Path.home() / "Downloads",
@@ -985,11 +1119,12 @@ def interactive_wizard():
     except Exception:
         pass
 
+    valid_exts = ['.iso', '.img', '.raw', '.bin', '.dmg']
     for s_dir in search_dirs:
         if s_dir.exists():
             try:
                 for f in s_dir.iterdir():
-                    if f.is_file() and f.suffix.lower() in ['.iso', '.img']:
+                    if f.is_file() and f.suffix.lower() in valid_exts:
                         real_p = str(f.resolve())
                         if real_p not in seen_paths:
                             seen_paths.add(real_p)
@@ -998,24 +1133,24 @@ def interactive_wizard():
                 pass
 
     if suggested_isos:
-        print("Found recent ISO files & Windows media:")
+        print("Found recent OS images & media:")
         for s_idx, iso_p in enumerate(suggested_isos[:6], 1):
             if iso_p.is_dir():
-                print(f"  [{s_idx}] {Colors.BOLD}{iso_p.name}{Colors.RESET} {Colors.GREEN}(Mounted Windows Media){Colors.RESET}")
+                print(f"  [{s_idx}] {Colors.BOLD}{iso_p.name}{Colors.RESET} {Colors.GREEN}(Mounted Media){Colors.RESET}")
                 print(f"      {Colors.DIM}{iso_p}{Colors.RESET}")
             else:
                 print(f"  [{s_idx}] {iso_p.name} ({format_size(iso_p.stat().st_size)})")
                 print(f"      {Colors.DIM}{iso_p.parent}{Colors.RESET}")
         print("  [0] Enter a different path manually (or drag & drop file)")
 
-        choice_iso = input(f"\nSelect ISO [1-{min(len(suggested_isos), 6)}] or 0: ").strip()
+        choice_iso = input(f"\nSelect Image [1-{min(len(suggested_isos), 6)}] or 0: ").strip()
         if choice_iso.isdigit() and 1 <= int(choice_iso) <= len(suggested_isos):
             iso_path = str(suggested_isos[int(choice_iso) - 1])
         else:
-            iso_path = input("Enter path to ISO (or drag & drop the file into this window): ").strip()
+            iso_path = input("Enter path to image (or drag & drop file into this window): ").strip()
     else:
-        print(f"{Colors.YELLOW}No ISO files found automatically.{Colors.RESET}")
-        iso_path = input("Enter full path to Windows 11 ISO (or drag & drop the file into this window): ").strip()
+        print(f"{Colors.YELLOW}No images found automatically.{Colors.RESET}")
+        iso_path = input("Enter full path to OS ISO or image (or drag & drop file): ").strip()
 
     # Expand ~ or quotes or escape backslashes from drag & drop
     iso_path = iso_path.strip().strip("'\"").replace("\\ ", " ")
@@ -1024,26 +1159,33 @@ def interactive_wizard():
         log_error(f"File not found: {iso_path}")
         sys.exit(1)
 
-    # Step 3: Inspect ISO
+    # Step 3: Inspect Image
     inspector = ISOInspector(iso_path)
     if not inspector.mount():
-        log_error("Failed to validate Windows ISO. Aborting.")
+        log_error("Failed to validate image. Aborting.")
         sys.exit(1)
 
-    # Step 4: Configuration Options (Rufus WUE)
-    print(f"\n{Colors.BOLD}Windows User Experience (WUE) Customizations:{Colors.RESET}")
-    print(f"  [1] Bypass TPM 2.0 and Secure Boot checks     {Colors.GREEN}[Enabled]{Colors.RESET}")
-    print(f"  [2] Bypass 4GB+ RAM, Storage & CPU checks     {Colors.GREEN}[Enabled]{Colors.RESET}")
-    print(f"  [3] Bypass Online Microsoft Account (BypassNRO){Colors.GREEN}[Enabled]{Colors.RESET}")
-    print(f"  [4] Disable BitLocker Automatic Encryption    {Colors.GREEN}[Enabled]{Colors.RESET}")
+    # Step 4: Configuration Options
+    enable_all = True
+    if inspector.os_type == "windows":
+        print(f"\n{Colors.BOLD}Windows User Experience (WUE) Customizations:{Colors.RESET}")
+        print(f"  [1] Bypass TPM 2.0 and Secure Boot checks     {Colors.GREEN}[Enabled]{Colors.RESET}")
+        print(f"  [2] Bypass 4GB+ RAM, Storage & CPU checks     {Colors.GREEN}[Enabled]{Colors.RESET}")
+        print(f"  [3] Bypass Online Microsoft Account (BypassNRO){Colors.GREEN}[Enabled]{Colors.RESET}")
+        print(f"  [4] Disable BitLocker Automatic Encryption    {Colors.GREEN}[Enabled]{Colors.RESET}")
 
-    customize = input("\nKeep all recommended bypasses enabled? (Y/n): ").strip().lower()
-    enable_all = (customize != 'n')
+        customize = input("\nKeep all recommended bypasses enabled? (Y/n): ").strip().lower()
+        enable_all = (customize != 'n')
+    else:
+        print(f"\n{Colors.BOLD}Operating System Payload:{Colors.RESET} {inspector.os_name}")
+        print(f"  Flashing Engine: Native Block Stream (Direct Hybrid / DD Mode)")
+        enable_all = False
 
     # Step 5: Final Confirmation Safeguard
     print("\n" + f"{Colors.RED}{Colors.BOLD}" + "!"*65)
     print("                      WARNING: DATA LOSS")
     print(f"All existing data on {selected_disk['media_name']} ({selected_disk['device_node']}) will be DESTROYED!")
+    print(f"Target payload: {inspector.os_name}")
     print("!"*65 + f"{Colors.RESET}\n")
 
     confirm = input(f"Are you sure you want to proceed and erase {selected_disk['device_node']}? (type 'YES' to confirm): ").strip()
@@ -1126,17 +1268,18 @@ def install_cli():
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Rufus for macOS (rufus-mac) - Reliable Windows 11 Bootable USB Creator for Mac",
-        epilog="Supported macOS: 10.15 Catalina through macOS 27 Golden Gate (Apple Silicon & Intel)"
+        description=f"Rufus for macOS (rufus-mac) {DISPLAY_VERSION} - Universal Multi-OS Bootable USB Creator for Mac",
+        epilog="Supported OS: Windows 11/10, Linux (Ubuntu, Debian, Fedora, Arch, Mint), and Raw Images (.img, .raw)"
     )
-    parser.add_argument("--iso", help="Path to Windows 10/11 ISO file")
+    parser.add_argument("--iso", "--image", dest="iso", help="Path to OS image file (.iso, .img, .raw, .bin)")
     parser.add_argument("--target", help="Target disk identifier (e.g. disk17)")
     parser.add_argument("--list-disks", action="store_true", help="List safe USB drives and exit")
+    parser.add_argument("--raw", "--dd", action="store_true", help="Force direct high-speed raw block writing mode (DD Mode)")
     parser.add_argument("--bypass-all", action="store_true", default=True, help="Enable all Windows 11 hardware and account bypasses")
     parser.add_argument("--no-bypass", action="store_true", help="Disable all Windows 11 bypasses")
     parser.add_argument("--single-fat32", action="store_true", help="Use single FAT32 partition with split WIM (requires wimlib)")
     parser.add_argument("--install", action="store_true", help="Install rufus-mac to system PATH (/usr/local/bin) for global access")
-    parser.add_argument("-v", "--version", action="version", version=f"RufusMac {VERSION}")
+    parser.add_argument("-v", "--version", action="version", version=f"rufus-mac {DISPLAY_VERSION} (v{VERSION})")
 
     args = parser.parse_args()
 
@@ -1162,7 +1305,7 @@ def main():
         return
 
     if not args.iso or not args.target:
-        log_error("Both --iso and --target must be specified in headless mode.")
+        log_error("Both --iso/--image and --target must be specified in headless mode.")
         parser.print_help()
         sys.exit(1)
 
@@ -1188,7 +1331,8 @@ def main():
         bypass_tpm_secureboot=enable_bypasses,
         bypass_ram_cpu_storage=enable_bypasses,
         bypass_online_account=enable_bypasses,
-        disable_bitlocker=enable_bypasses
+        disable_bitlocker=enable_bypasses,
+        force_raw=args.raw
     )
 
     try:

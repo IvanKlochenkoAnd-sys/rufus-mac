@@ -1,18 +1,19 @@
 # 🚀 Rufus for macOS (`rufus-mac`)
 
+[![Release](https://img.shields.io/badge/Release-Alpha_0.2-blueviolet?logo=github)](https://github.com/IvanKlochenkoAnd-sys/rufus-mac)
 [![macOS](https://img.shields.io/badge/macOS-10.15_Catalina_to_macOS_27_Golden_Gate-black?logo=apple)](https://apple.com)
 [![Architecture](https://img.shields.io/badge/Architecture-Apple_Silicon_%26_Intel-blue)](https://apple.com)
 [![Python](https://img.shields.io/badge/Python-3.7+-3776AB?logo=python&logoColor=white)](https://python.org)
-[![Windows 11](https://img.shields.io/badge/Target-Windows_11_24H2_%2F_23H2_%2F_10-0078D6?logo=windows&logoColor=white)](https://microsoft.com)
+[![Target OS](https://img.shields.io/badge/Target-Windows_11_%2F_Linux_%2F_Raw_Images-0078D6)](rufus-mac)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Zero Dependencies](https://img.shields.io/badge/Dependencies-Standard_Library_Only-success)](rufus-mac)
 
-The definitive, battle-tested macOS alternative to [Rufus](https://rufus.ie/) that creates **genuine, 100% bootable Windows 11 installation USB flash drives** directly from macOS for modern UEFI PCs.
+The definitive, battle-tested macOS alternative to [Rufus](https://rufus.ie/) that creates **genuine bootable USB flash drives** directly from macOS for **Windows 11 / 10**, **Linux Distributions (Ubuntu, Fedora, Debian, Arch, Mint)**, and **Raw Disk Images** (`.img`, `.raw`).
 
 ```
 =================================================================
-  RUFUS FOR MAC (rufus-mac)
-  Reliable, Bootable Windows 11 USB Creator for Mac
+  RUFUS FOR MAC (macOS 27 Edition) - Alpha 0.2
+  Universal Multi-OS Bootable USB Creator (Windows 11 & Linux)
 =================================================================
 [*] Scanning connected USB storage devices...
 
@@ -21,11 +22,10 @@ Select Target USB Drive:
 
 Enter choice [1-1]: 1
 [✓] Selected Target: DataTraveler 3.0 (/dev/disk17)
-[✓] ISO mounted at: /Volumes/CCCOMA_X64FRE_EN-US_DV9
-[✓] Valid Windows 11 image verified (UEFI Bootloader: Present, install.wim: 7.6 GB)
-[*] Partitioning USB: Universal Dual-Partition GPT (FAT32 Boot + ExFAT Data)...
+[✓] Detected OS Payload: Windows 11 / 10 UEFI Setup
+[*] Architecture: Universal Dual-Partition GPT (FAT32 Boot + ExFAT Data)
 [*] Transferring Windows 11 setup payload...
-[✓] BOOTABLE WINDOWS 11 USB SUCCESSFULLY CREATED!
+[✓] BOOTABLE USB DRIVE SUCCESSFULLY CREATED!
 ```
 
 ---
@@ -90,6 +90,18 @@ USB Drive (GPT Partition Map)
 
 ---
 
+## 🐧 Multi-OS & Linux Flashing Engine (Alpha 0.2)
+
+Starting with **Alpha 0.2**, `rufus-mac` automatically identifies the operating system payload in your image and applies the optimal flashing engine:
+
+| OS Family | Supported Formats | Engine Used | Features |
+| :--- | :--- | :--- | :--- |
+| **Windows 11 / 10** | `.iso` | Universal Dual-Partition GPT (FAT32 + ExFAT) | Automatic TPM 2.0, Secure Boot, RAM, BitLocker, & MS Account bypasses |
+| **Linux Live USB** | `.iso` (Hybrid) | High-Speed Native Block Stream (`/dev/rdisk`) | Ubuntu, Debian, Fedora, Arch Linux, Kali, Linux Mint, Manjaro, openSUSE |
+| **Raw Disk Images** | `.img`, `.raw`, `.bin` | High-Speed Native Block Stream (`/dev/rdisk`) | Raspberry Pi OS, Armbian, Proxmox VE, TrueNAS, OpenWrt |
+
+---
+
 ## 🛠️ Windows 11 User Experience (WUE) Bypasses
 
 `rufus-mac` automatically generates and injects a custom `autounattend.xml` answer file that bypasses Microsoft's artificial hardware and account restrictions during installation:
@@ -125,14 +137,20 @@ The wizard will:
 Automate drive creation in scripts or CI:
 
 ```bash
-# Full automated Windows 11 USB creation with all bypasses:
+# Automated Windows 11 creation with all hardware bypasses:
 rufus-mac --iso "/Users/Shared/Win11_24H2_English_x64.iso" --target disk17 --bypass-all
 
-# Safe disk discovery:
+# High-speed Linux live USB creation (Ubuntu, Fedora, Arch, etc.):
+rufus-mac --image "~/Downloads/ubuntu-24.04-desktop-amd64.iso" --target disk17
+
+# Raw image flashing (Raspberry Pi OS, Proxmox, TrueNAS, etc.):
+rufus-mac --image "~/Downloads/raspios-arm64.img" --target disk17
+
+# List safe external USB disks:
 rufus-mac --list-disks
 
-# Single FAT32 mode with split WIM (requires wimlib):
-rufus-mac --iso "/path/to/windows.iso" --target disk17 --single-fat32
+# Force raw DD block writing mode:
+rufus-mac --image "debian-live.iso" --target disk17 --raw
 ```
 
 ---
