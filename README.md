@@ -1,7 +1,7 @@
 # 🚀 Rufus for macOS (`rufus-mac`)
 
 [![Release](https://img.shields.io/badge/Release-Alpha_0.2-blueviolet?logo=github)](https://github.com/IvanKlochenkoAnd-sys/rufus-mac)
-[![macOS](https://img.shields.io/badge/macOS-10.15_Catalina_to_macOS_27_Golden_Gate-black?logo=apple)](https://apple.com)
+[![macOS](https://img.shields.io/badge/macOS-10.9_Mavericks_to_macOS_27_Golden_Gate-black?logo=apple)](https://apple.com)
 [![Architecture](https://img.shields.io/badge/Architecture-Apple_Silicon_%26_Intel-blue)](https://apple.com)
 [![Python](https://img.shields.io/badge/Python-3.7+-3776AB?logo=python&logoColor=white)](https://python.org)
 [![Target OS](https://img.shields.io/badge/Target-Windows_11_%2F_Linux_%2F_Raw_Images-0078D6)](rufus-mac)
@@ -169,6 +169,12 @@ rufus-mac --image "debian-live.iso" --target disk17 --raw
 | **macOS 12** | Monterey | Apple Silicon / Intel | ✅ Fully Supported |
 | **macOS 11** | Big Sur | Apple Silicon / Intel | ✅ Fully Supported |
 | **macOS 10.15** | Catalina | Intel | ✅ Fully Supported |
+| **macOS 10.14** | Mojave | Intel | ✅ Fully Supported |
+| **macOS 10.13** | High Sierra | Intel | ✅ Fully Supported |
+| **macOS 10.12** | Sierra | Intel | ✅ Fully Supported |
+| **OS X 10.11** | El Capitan | Intel | ✅ Fully Supported |
+| **OS X 10.10** | Yosemite | Intel | ✅ Fully Supported |
+| **OS X 10.9** | Mavericks | Intel | ✅ Fully Supported |
 
 ---
 

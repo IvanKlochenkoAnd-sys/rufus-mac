@@ -65,6 +65,20 @@ def format_size(bytes_val: int) -> str:
     return f"{bytes_val:.1f} PB"
 
 
+def run_cmd(cmd: List[str], check: bool = False, **kwargs) -> subprocess.CompletedProcess:
+    """
+    Subprocess runner supporting Python 3.5+ and OS X 10.9 Mavericks through macOS 27 Golden Gate.
+    Automatically normalizes capture_output and text arguments across varying Python 3 minor versions.
+    """
+    if 'capture_output' in kwargs:
+        kwargs.pop('capture_output')
+        kwargs['stdout'] = subprocess.PIPE
+        kwargs['stderr'] = subprocess.PIPE
+    if 'text' in kwargs:
+        kwargs['universal_newlines'] = kwargs.pop('text')
+    return subprocess.run(cmd, check=check, **kwargs)
+
+
 class DiskManager:
     """Manages disk enumeration, filtering, and safety checks on macOS."""
 
@@ -102,10 +116,10 @@ class DiskManager:
             if bus_protocol in ['Disk Image', 'Virtual', 'Apple Fabric']:
                 continue
 
-            # 3. Must be external, removable media, or USB/Thunderbolt bus protocol
+            # 3. Must be external, removable media, or USB/Thunderbolt/FireWire/SD bus protocol
             is_external = (info.get('Internal') is False) or (info.get('DeviceLocation') == 'External')
-            is_removable = info.get('Removable', False) or info.get('RemovableMedia', False)
-            is_usb_tb = (bus_protocol in ['USB', 'Thunderbolt', 'FireWire'])
+            is_removable = info.get('Removable', False) or info.get('RemovableMedia', False) or info.get('Ejectable', False)
+            is_usb_tb = (bus_protocol in ['USB', 'Thunderbolt', 'FireWire', 'Secure Digital'])
 
             if not (is_external or is_usb_tb or is_removable):
                 continue
@@ -162,13 +176,13 @@ class DiskManager:
         log_info(f"Unmounting {dev_node}...")
         
         # Attempt 1: Standard graceful unmount
-        res = subprocess.run(['diskutil', 'unmountDisk', dev_node], capture_output=True, text=True)
+        res = run_cmd(['diskutil', 'unmountDisk', dev_node], capture_output=True, text=True)
         if res.returncode == 0:
             return True
             
         # Attempt 2: Forced unmount
         log_warn("Standard unmount busy. Attempting forced unmount...")
-        res_force = subprocess.run(['diskutil', 'unmountDisk', 'force', dev_node], capture_output=True, text=True)
+        res_force = run_cmd(['diskutil', 'unmountDisk', 'force', dev_node], capture_output=True, text=True)
         if res_force.returncode == 0:
             return True
             
@@ -176,10 +190,10 @@ class DiskManager:
         dev_id = dev_node.replace("/dev/", "")
         for i in range(1, 5):
             part_node = f"/dev/{dev_id}s{i}"
-            subprocess.run(['diskutil', 'unmount', 'force', part_node], capture_output=True)
+            run_cmd(['diskutil', 'unmount', 'force', part_node], capture_output=True)
             
         time.sleep(1)
-        res_final = subprocess.run(['diskutil', 'unmountDisk', 'force', dev_node], capture_output=True, text=True)
+        res_final = run_cmd(['diskutil', 'unmountDisk', 'force', dev_node], capture_output=True, text=True)
         return res_final.returncode == 0
 
 
@@ -261,7 +275,7 @@ class ISOInspector:
 
         # Step 1: Remove quarantine attribute if present
         try:
-            subprocess.run(['xattr', '-d', 'com.apple.quarantine', str(self.iso_path)], capture_output=True)
+            run_cmd(['xattr', '-d', 'com.apple.quarantine', str(self.iso_path)], capture_output=True)
         except Exception:
             pass
 
@@ -284,7 +298,7 @@ class ISOInspector:
                 '-nomount',
                 str(self.iso_path)
             ]
-            res = subprocess.run(attach_cmd, capture_output=True, text=True)
+            res = run_cmd(attach_cmd, capture_output=True, text=True)
             if res.returncode == 0:
                 dev_match = re.search(r"(/dev/disk\d+)", res.stdout)
                 if dev_match:
@@ -292,9 +306,9 @@ class ISOInspector:
                     self.attached_dev = dev_node
                     time.sleep(0.5)
                     # Mount the attached disk read-only
-                    mount_res = subprocess.run(['diskutil', 'mount', 'readOnly', dev_node], capture_output=True, text=True)
+                    mount_res = run_cmd(['diskutil', 'mount', 'readOnly', dev_node], capture_output=True, text=True)
                     # Retrieve the mount point via diskutil info
-                    info_res = subprocess.run(['diskutil', 'info', '-plist', dev_node], capture_output=True)
+                    info_res = run_cmd(['diskutil', 'info', '-plist', dev_node], capture_output=True)
                     if info_res.returncode == 0:
                         info = plistlib.loads(info_res.stdout)
                         mp = info.get('MountPoint')
@@ -338,7 +352,7 @@ class ISOInspector:
 
         last_err = ""
         for cmd in mount_attempts:
-            res = subprocess.run(cmd, capture_output=True, text=True)
+            res = run_cmd(cmd, capture_output=True, text=True)
             if res.returncode == 0:
                 out = res.stdout
                 lines = out.strip().split('\n')
@@ -452,9 +466,9 @@ class ISOInspector:
     def unmount(self):
         if self.attached_dev:
             log_info(f"Detaching ISO image ({self.attached_dev})...")
-            subprocess.run(['diskutil', 'unmount', 'force', self.attached_dev], capture_output=True)
-            subprocess.run(['diskutil', 'eject', self.attached_dev], capture_output=True)
-            subprocess.run(['hdiutil', 'detach', self.attached_dev], capture_output=True)
+            run_cmd(['diskutil', 'unmount', 'force', self.attached_dev], capture_output=True)
+            run_cmd(['diskutil', 'eject', self.attached_dev], capture_output=True)
+            run_cmd(['hdiutil', 'detach', self.attached_dev], capture_output=True)
             self.attached_dev = None
             self.mount_point = None
 
@@ -832,7 +846,7 @@ class RufusWriter:
         subprocess.run(['sync'])
         time.sleep(1)
         log_info(f"Ejecting {self.dev_node}...")
-        subprocess.run(['diskutil', 'eject', self.dev_node], capture_output=True)
+        run_cmd(['diskutil', 'eject', self.dev_node], capture_output=True)
 
         elapsed = time.time() - start_time
         mins, secs = divmod(int(elapsed), 60)
@@ -854,9 +868,9 @@ class RufusWriter:
         log_info(f"Executing: {' '.join(cmd)}")
         # If running as non-root, do not capture stdin/stdout so sudo can prompt for password if needed
         if os.geteuid() != 0:
-            res = subprocess.run(cmd)
+            res = run_cmd(cmd)
         else:
-            res = subprocess.run(cmd, capture_output=True, text=True)
+            res = run_cmd(cmd, capture_output=True, text=True)
 
         if res.returncode != 0:
             err_msg = getattr(res, 'stderr', None) or getattr(res, 'stdout', None) or ""
@@ -874,9 +888,9 @@ class RufusWriter:
         cmd = (['sudo'] + base_cmd) if os.geteuid() != 0 else base_cmd
         log_info(f"Executing: {' '.join(cmd)}")
         if os.geteuid() != 0:
-            res = subprocess.run(cmd)
+            res = run_cmd(cmd)
         else:
-            res = subprocess.run(cmd, capture_output=True, text=True)
+            res = run_cmd(cmd, capture_output=True, text=True)
 
         if res.returncode != 0:
             err_msg = getattr(res, 'stderr', None) or getattr(res, 'stdout', None) or ""
@@ -906,7 +920,7 @@ class RufusWriter:
 
         # Fallback check via diskutil info
         if not boot_vol:
-            for part_id in [f"{self.dev_id}s1", f"{self.dev_id}s2"]:
+            for part_id in [f"{self.dev_id}s2", f"{self.dev_id}s3", f"{self.dev_id}s1", f"{self.dev_id}s4"]:
                 p_info = DiskManager.get_disk_info(part_id)
                 if p_info and p_info.get('Mounted', False):
                     mp = Path(p_info.get('MountPoint', ''))
@@ -1269,7 +1283,7 @@ def install_cli():
 def main():
     parser = argparse.ArgumentParser(
         description=f"Rufus for macOS (rufus-mac) {DISPLAY_VERSION} - Universal Multi-OS Bootable USB Creator for Mac",
-        epilog="Supported OS: Windows 11/10, Linux (Ubuntu, Debian, Fedora, Arch, Mint), and Raw Images (.img, .raw)"
+        epilog="Supported OS: OS X 10.9 Mavericks through macOS 27 Golden Gate (Apple Silicon & Intel) | Windows 11/10, Linux, & Raw Images"
     )
     parser.add_argument("--iso", "--image", dest="iso", help="Path to OS image file (.iso, .img, .raw, .bin)")
     parser.add_argument("--target", help="Target disk identifier (e.g. disk17)")

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
 #  Rufus for macOS (rufus-mac) - One-Line Installer
-#  Compatible with macOS 10.15 Catalina through macOS 27 Golden Gate
+#  Compatible with OS X 10.9 Mavericks through macOS 27 Golden Gate
 # ==============================================================================
 
 set -e
@@ -17,7 +17,7 @@ YELLOW="\033[93m"
 RESET="\033[0m"
 
 echo -e "\n${BOLD}${CYAN}=================================================================${RESET}"
-echo -e "${BOLD}${CYAN}  Rufus for macOS - Reliable Windows 11 USB Creator Installer    ${RESET}"
+echo -e "${BOLD}${CYAN}  Rufus for macOS - Multi-OS Bootable USB Creator Installer      ${RESET}"
 echo -e "${BOLD}${CYAN}=================================================================${RESET}\n"
 
 # Verify macOS environment
@@ -28,8 +28,18 @@ fi
 
 # Verify Python 3
 if ! command -v python3 &>/dev/null; then
-    echo -e "${YELLOW}Error: Python 3 is required. Please install Xcode Command Line Tools:${RESET}"
-    echo "  xcode-select --install"
+    MAC_VER=$(sw_vers -productVersion 2>/dev/null || echo "10.15")
+    echo -e "${YELLOW}Python 3 was not found on your system.${RESET}"
+    if command -v brew &>/dev/null; then
+        echo -e "[*] Installing Python 3 via Homebrew..."
+        brew install python3
+    elif [[ "$MAC_VER" < "10.15" ]]; then
+        echo -e "For OS X / macOS ${MAC_VER} (pre-Catalina), please install Python 3.8+ from:"
+        echo -e "  https://www.python.org/downloads/macos/"
+    else
+        echo -e "Please install Xcode Command Line Tools:"
+        echo "  xcode-select --install"
+    fi
     exit 1
 fi
 
