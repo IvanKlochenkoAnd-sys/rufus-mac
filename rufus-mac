@@ -29,8 +29,8 @@ import argparse
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 
-VERSION = "0.2.0-alpha"
-DISPLAY_VERSION = "Alpha 0.2"
+VERSION = "0.3.0-alpha"
+DISPLAY_VERSION = "Alpha 0.3"
 
 # ANSI Terminal Colors
 class Colors:

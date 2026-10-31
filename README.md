@@ -1,6 +1,6 @@
 # 🚀 Rufus for macOS (`rufus-mac`)
 
-[![Release](https://img.shields.io/badge/Release-Alpha_0.2-blueviolet?logo=github)](https://github.com/IvanKlochenkoAnd-sys/rufus-mac)
+[![Release](https://img.shields.io/badge/Release-Alpha_0.3-blueviolet?logo=github)](https://github.com/IvanKlochenkoAnd-sys/rufus-mac)
 [![macOS](https://img.shields.io/badge/macOS-10.9_Mavericks_to_macOS_27_Golden_Gate-black?logo=apple)](https://apple.com)
 [![Architecture](https://img.shields.io/badge/Architecture-Apple_Silicon_%26_Intel-blue)](https://apple.com)
 [![Python](https://img.shields.io/badge/Python-3.7+-3776AB?logo=python&logoColor=white)](https://python.org)
@@ -12,7 +12,7 @@ The definitive, battle-tested macOS alternative to [Rufus](https://rufus.ie/) th
 
 ```
 =================================================================
-  RUFUS FOR MAC (macOS 27 Edition) - Alpha 0.2
+  RUFUS FOR MAC (macOS 27 Edition) - Alpha 0.3
   Universal Multi-OS Bootable USB Creator (Windows 11 & Linux)
 =================================================================
 [*] Scanning connected USB storage devices...
@@ -90,9 +90,9 @@ USB Drive (GPT Partition Map)
 
 ---
 
-## 🐧 Multi-OS & Linux Flashing Engine (Alpha 0.2)
+## 🐧 Multi-OS & Linux Flashing Engine (Alpha 0.3)
 
-Starting with **Alpha 0.2**, `rufus-mac` automatically identifies the operating system payload in your image and applies the optimal flashing engine:
+Starting with **Alpha 0.3**, `rufus-mac` automatically identifies the operating system payload in your image and applies the optimal flashing engine:
 
 | OS Family | Supported Formats | Engine Used | Features |
 | :--- | :--- | :--- | :--- |
@@ -161,8 +161,8 @@ rufus-mac --image "debian-live.iso" --target disk17 --raw
 
 | macOS Version | Codename | Architectures | Status |
 | :--- | :--- | :--- | :--- |
-| **macOS 27** | Golden Gate | Apple Silicon / Intel | ✅ Fully Supported |
-| **macOS 26** | — | Apple Silicon / Intel | ✅ Fully Supported |
+| **macOS 27** | Golden Gate | Apple Silicon | ✅ Fully Supported |
+| **macOS 26** | Tahoe | Apple Silicon / Intel | ✅ Fully Supported |
 | **macOS 15** | Sequoia | Apple Silicon / Intel | ✅ Fully Supported |
 | **macOS 14** | Sonoma | Apple Silicon / Intel | ✅ Fully Supported |
 | **macOS 13** | Ventura | Apple Silicon / Intel | ✅ Fully Supported |
