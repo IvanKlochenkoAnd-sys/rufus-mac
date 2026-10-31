@@ -1,21 +1,23 @@
 #!/usr/bin/env python3
 """
-Rufus for macOS (RufusMac) - Professional Windows 11 Bootable USB Creator
-Engineered for macOS (including macOS 27 / Sequoia / Sonoma / Apple Silicon & Intel)
+Rufus for macOS (rufus-mac) - Universal Multi-OS & Multi-Windows Bootable USB Creator
+Engineered for macOS (OS X 10.9 Mavericks through macOS 27 Golden Gate / Apple Silicon & Intel)
 
 Features:
-- Full Windows 11 24H2 / 23H2 / 22H2 UEFI bootable drive creation
-- Automatic detection of external USB thumb drives (with strict internal disk protection)
-- Dual-Partition Universal UEFI Architecture (FAT32 Boot + ExFAT Data)
-  * Solves the >4GB install.wim FAT32 limitation without third-party tools
-  * Works on 100% of UEFI motherboards out of the box
-- Optional Single-Partition Split WIM (SWM) support via wimlib if installed
-- Windows 11 Bypasses (Rufus WUE):
-  * Bypass TPM 2.0, Secure Boot, 4GB+ RAM, Storage & CPU checks
-  * Bypass mandatory Microsoft online account requirement (BypassNRO)
-  * Disable automatic BitLocker device encryption
-  * Zero-byte appraiserres.dll patch
-- Interactive CLI Wizard & Headless Command-Line Mode
+- Windows Support:
+  * Windows 11 (24H2, 23H2, 22H2) with Rufus WUE bypasses (TPM 2.0, Secure Boot, RAM, CPU, Storage, Online Account, BitLocker)
+  * Windows 10 (22H2, 21H2, etc.) with local account and BitLocker bypasses
+  * Windows 8.1 & Windows 8 (UEFI GPT or Legacy MBR)
+  * Windows 7 SP1 / 7 with automatic Windows 7 x64 UEFI Bootloader Patch (bootx64.efi generation) or Legacy MBR BIOS
+  * Windows Vista (MBR BIOS)
+  * Windows XP & Windows Server 2003 (Classic NT 5.x Setup, single MBR FAT32)
+- Partition Schemes:
+  * GPT (UEFI) - Modern PCs with native UEFI boot
+  * MBR (BIOS / CSM) - Legacy PCs, older motherboards, and vintage Windows OS
+- Universal Dual-Partition Architecture (FAT32 Boot + ExFAT Data) solving the >4GB install.wim limit
+- Multi-OS Linux Live USB (Ubuntu, Debian, Fedora, Arch, Kali, Mint, etc.) via high-speed native block stream
+- Raw disk image flashing (.img, .raw, .bin, .dmg)
+- Interactive CLI Wizard & Headless CLI Mode
 """
 
 import sys
@@ -25,12 +27,13 @@ import subprocess
 import shutil
 import time
 import re
+import struct
 import argparse
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 
-VERSION = "0.3.0-alpha"
-DISPLAY_VERSION = "Alpha 0.3"
+VERSION = "0.4.0-alpha"
+DISPLAY_VERSION = "Alpha 0.4"
 
 # ANSI Terminal Colors
 class Colors:
@@ -77,6 +80,46 @@ def run_cmd(cmd: List[str], check: bool = False, **kwargs) -> subprocess.Complet
     if 'text' in kwargs:
         kwargs['universal_newlines'] = kwargs.pop('text')
     return subprocess.run(cmd, check=check, **kwargs)
+
+
+def parse_wim_info(wim_path: Path) -> Dict[str, any]:
+    """Parses XML manifest embedded in a WIM file to extract Windows edition, build number, and architecture."""
+    info = {'name': None, 'edition': None, 'build': None, 'major': None, 'arch': None}
+    try:
+        with open(wim_path, 'rb') as f:
+            hdr = f.read(208)
+            if hdr[:8] != b'MSWIM\x00\x00\x00':
+                return info
+            size_flags, offset, orig_size = struct.unpack('<QQQ', hdr[72:96])
+            flags_byte = (size_flags >> 56) & 0xFF
+            compressed_size = size_flags & 0x00FFFFFFFFFFFFFF
+            f.seek(offset)
+            to_read = min(orig_size if orig_size > 0 else (compressed_size if compressed_size > 0 else 262144), 1048576)
+            raw = f.read(to_read)
+            text = raw.decode('utf-16le', errors='ignore')
+            if '<IMAGE' not in text and '<WIM' not in text:
+                text = raw.decode('utf-8', errors='ignore')
+
+            build_m = re.search(r'<BUILD>(\d+)</BUILD>', text)
+            if build_m:
+                info['build'] = int(build_m.group(1))
+            major_m = re.search(r'<MAJOR(?:VERSION)?>(\d+)</MAJOR(?:VERSION)?>', text)
+            if major_m:
+                info['major'] = int(major_m.group(1))
+            product_m = re.search(r'<PRODUCTNAME>([^<]+)</PRODUCTNAME>', text)
+            name_m = re.search(r'<NAME>([^<]+)</NAME>', text)
+            if product_m:
+                info['edition'] = product_m.group(1).strip()
+            if name_m:
+                info['name'] = name_m.group(1).strip()
+            arch_m = re.search(r'<ARCH>(\d+)</ARCH>', text)
+            if arch_m:
+                arch_code = int(arch_m.group(1))
+                info['arch'] = 'x64' if arch_code == 9 else ('arm64' if arch_code == 12 else 'x86')
+    except Exception:
+        pass
+    return info
+
 
 
 class DiskManager:
@@ -198,13 +241,20 @@ class DiskManager:
 
 
 class ISOInspector:
-    """Mounts and inspects Windows ISO images for Windows 11 compatibility."""
+    """Mounts and inspects Windows, Linux, and raw disk images."""
 
     def __init__(self, iso_path: str):
         self.iso_path = Path(iso_path).resolve()
         self.mount_point: Optional[Path] = None
         self.attached_dev: Optional[str] = None
         self.is_windows = False
+        self.is_legacy_win = False  # True for Windows XP / Server 2003
+        self.is_win11 = False
+        self.win_version = ""
+        self.win_build: Optional[int] = None
+        self.win_edition: Optional[str] = None
+        self.win_arch = "x64"
+        self.has_win7_uefi_patchable = False
         self.os_type = "unknown"
         self.os_name = "Unknown Payload"
         self.file_size = self.iso_path.stat().st_size if self.iso_path.exists() and self.iso_path.is_file() else 0
@@ -387,16 +437,40 @@ class ISOInspector:
     def _inspect(self) -> bool:
         assert self.mount_point is not None
 
-        # Look for UEFI bootloader
+        # 1. Check Legacy Windows signatures (Windows XP / Server 2003)
+        txtsetup_i386 = self.find_file(self.mount_point, ['i386', 'txtsetup.sif'])
+        txtsetup_amd64 = self.find_file(self.mount_point, ['amd64', 'txtsetup.sif'])
+        has_win51 = any(f.name.lower().startswith('win51') for f in self.mount_point.iterdir() if f.is_file())
+        
+        if (txtsetup_i386 or txtsetup_amd64) or (has_win51 and (self.find_file(self.mount_point, ['i386']) or self.find_file(self.mount_point, ['amd64']))):
+            self.is_windows = True
+            self.is_legacy_win = True
+            self.is_win11 = False
+            self.has_uefi = False
+            self.os_type = "windows_legacy"
+            if txtsetup_amd64 or self.find_file(self.mount_point, ['amd64']):
+                self.win_arch = "x64"
+                self.win_version = "Windows XP Professional x64 / Server 2003"
+            else:
+                self.win_arch = "x86"
+                self.win_version = "Windows XP / Server 2003"
+            self.os_name = f"{self.win_version} ({self.win_arch}) Setup"
+            log_success(f"Detected OS: {self.os_name}")
+            log_info("Boot Mode: Legacy BIOS / CSM (MBR Partition Map)")
+            log_info("Payload Type: Windows NT 5.x Classic Setup")
+            return True
+
+        # 2. Look for UEFI bootloader
         efi_boot_x64 = self.find_file(self.mount_point, ['efi', 'boot', 'bootx64.efi'])
         efi_boot_arm64 = self.find_file(self.mount_point, ['efi', 'boot', 'bootaa64.efi'])
-        self.has_uefi = bool(efi_boot_x64 or efi_boot_arm64)
+        efi_boot_ia32 = self.find_file(self.mount_point, ['efi', 'boot', 'bootia32.efi'])
+        self.has_uefi = bool(efi_boot_x64 or efi_boot_arm64 or efi_boot_ia32)
 
-        # Look for WinPE boot image
+        # 3. Look for WinPE boot image
         boot_wim = self.find_file(self.mount_point, ['sources', 'boot.wim'])
         self.has_boot_wim = bool(boot_wim)
 
-        # Look for OS payload (install.wim or install.esd)
+        # 4. Look for OS payload (install.wim or install.esd)
         install_wim = self.find_file(self.mount_point, ['sources', 'install.wim'])
         install_esd = self.find_file(self.mount_point, ['sources', 'install.esd'])
         self.install_wim_path = install_wim or install_esd
@@ -410,13 +484,73 @@ class ISOInspector:
 
         if self.is_windows:
             self.os_type = "windows"
-            self.os_name = "Windows 11 / 10 UEFI Setup"
-            wim_name = self.install_wim_path.name if self.install_wim_path else "install.wim"
+            wim_info = parse_wim_info(self.install_wim_path)
+            if wim_info.get('build'):
+                self.win_build = wim_info['build']
+                if wim_info.get('arch'):
+                    self.win_arch = wim_info['arch']
+                if wim_info.get('edition'):
+                    self.win_edition = wim_info['edition']
+                elif wim_info.get('name'):
+                    self.win_edition = wim_info['name']
+
+                b = self.win_build
+                if b >= 22000:
+                    self.is_win11 = True
+                    self.win_version = "Windows 11"
+                elif 10240 <= b < 22000:
+                    self.is_win11 = False
+                    self.win_version = "Windows 10"
+                elif 9600 <= b < 10240:
+                    self.is_win11 = False
+                    self.win_version = "Windows 8.1"
+                elif 9200 <= b < 9600:
+                    self.is_win11 = False
+                    self.win_version = "Windows 8"
+                elif 7600 <= b <= 7601:
+                    self.is_win11 = False
+                    self.win_version = "Windows 7"
+                elif 6000 <= b <= 6003:
+                    self.is_win11 = False
+                    self.win_version = "Windows Vista"
+                else:
+                    self.is_win11 = (b >= 22000)
+                    self.win_version = f"Windows (Build {b})"
+            else:
+                self.win_version = "Windows 11 / 10"
+                self.is_win11 = True
+
+            # Windows 7 UEFI compatibility check:
+            if not self.has_uefi and ("7" in self.win_version or self.win_build in [7600, 7601]):
+                cdboot = self.find_file(self.mount_point, ['efi', 'microsoft', 'boot', 'cdboot.efi'])
+                bootmgfw = self.find_file(self.mount_point, ['efi', 'microsoft', 'boot', 'bootmgfw.efi'])
+                if cdboot or bootmgfw:
+                    self.has_win7_uefi_patchable = True
+
+            desc_parts = [self.win_version]
+            if self.win_edition:
+                desc_parts.append(f"({self.win_edition})")
+            elif self.win_arch:
+                desc_parts.append(f"[{self.win_arch}]")
+            if self.win_build:
+                desc_parts.append(f"Build {self.win_build}")
+            desc_parts.append("Setup")
+            self.os_name = " ".join(desc_parts)
+
             log_success(f"Detected OS: {self.os_name}")
-            log_info(f"UEFI Bootloader: {'Present (x64/ARM64)' if self.has_uefi else 'Missing'}")
+            if self.has_uefi:
+                log_info(f"UEFI Bootloader: Present ({self.win_arch} Native EFI)")
+            elif self.has_win7_uefi_patchable:
+                log_info(f"UEFI Bootloader: Supported via Windows 7 UEFI Boot Patch ({self.win_arch})")
+            else:
+                log_info("UEFI Bootloader: Missing (Standard MBR / Legacy BIOS Boot)")
+
+            wim_name = self.install_wim_path.name if self.install_wim_path else "install.wim"
             log_info(f"OS Payload: {wim_name} ({format_size(self.install_wim_size)})")
             if self.is_wim_large:
                 log_warn(f"{wim_name} exceeds the 4GB FAT32 limit! Automatic dual-partition UEFI mode will be utilized.")
+            else:
+                log_info(f"{wim_name} is under 4GB ({format_size(self.install_wim_size)}). Fits directly in FAT32.")
             return True
 
         # Check Linux distribution signatures
@@ -621,9 +755,9 @@ class WindowsCustomizer:
         return xml_content
 
     @staticmethod
-    def apply_bypasses(target_volume: Path, autounattend_xml: str):
-        """Writes autounattend.xml and applies the appraiser bypass."""
-        log_info(f"Injecting Windows 11 bypasses into {target_volume.name}...")
+    def apply_bypasses(target_volume: Path, autounattend_xml: str, patch_appraiser: bool = True):
+        """Writes autounattend.xml and optionally applies the appraiser bypass."""
+        log_info(f"Injecting Windows configuration into {target_volume.name}...")
 
         # 1. Root autounattend.xml
         root_xml = target_volume / "autounattend.xml"
@@ -644,19 +778,20 @@ class WindowsCustomizer:
         except Exception as e:
             log_warn(f"Note: Could not create Panther backup directory: {e}")
 
-        # 3. Patch sources/appraiserres.dll if it exists (legacy compatibility gate bypass)
-        sources_dir = target_volume / "sources"
-        if sources_dir.exists():
-            for item in sources_dir.iterdir():
-                if item.name.lower() == "appraiserres.dll":
-                    try:
-                        # Zero out the file
-                        with open(item, 'wb') as f:
-                            f.write(b"")
-                        log_success("Patched sources/appraiserres.dll (Zeroed compatibility appraiser)")
-                    except Exception as e:
-                        log_warn(f"Could not patch appraiserres.dll: {e}")
-                    break
+        # 3. Patch sources/appraiserres.dll if it exists (legacy compatibility gate bypass for Win11)
+        if patch_appraiser:
+            sources_dir = target_volume / "sources"
+            if sources_dir.exists():
+                for item in sources_dir.iterdir():
+                    if item.name.lower() == "appraiserres.dll":
+                        try:
+                            # Zero out the file
+                            with open(item, 'wb') as f:
+                                f.write(b"")
+                            log_success("Patched sources/appraiserres.dll (Zeroed compatibility appraiser)")
+                        except Exception as e:
+                            log_warn(f"Could not patch appraiserres.dll: {e}")
+                        break
 
 
 class RufusWriter:
@@ -666,6 +801,7 @@ class RufusWriter:
         self,
         disk_identifier: str,
         iso_inspector: ISOInspector,
+        partition_scheme: str = "GPT",
         use_dual_partition: bool = True,
         bypass_tpm_secureboot: bool = True,
         bypass_ram_cpu_storage: bool = True,
@@ -677,6 +813,7 @@ class RufusWriter:
         self.dev_id = disk_identifier
         self.dev_node = f"/dev/{disk_identifier}"
         self.iso = iso_inspector
+        self.partition_scheme = partition_scheme.upper()
         self.use_dual_partition = use_dual_partition
         self.bypass_tpm = bypass_tpm_secureboot
         self.bypass_hardware = bypass_ram_cpu_storage
@@ -688,17 +825,158 @@ class RufusWriter:
     def write(self) -> bool:
         if self.force_raw or self.iso.os_type in ["linux", "raw_image", "hybrid"]:
             return self._write_raw_image()
+        elif self.iso.os_type == "windows_legacy":
+            return self._write_windows_legacy()
         else:
             return self._write_windows()
+
+    def _patch_win7_uefi(self, target_vol: Path) -> bool:
+        """
+        Windows 7 x64 UEFI Bootloader Patch:
+        Windows 7 64-bit ISOs lack /efi/boot/bootx64.efi on the install media root.
+        This patch extracts or copies cdboot.efi / bootmgfw.efi to /efi/boot/bootx64.efi.
+        """
+        efi_boot_dir = target_vol / "efi" / "boot"
+        bootx64 = efi_boot_dir / "bootx64.efi"
+        if bootx64.exists() and bootx64.stat().st_size > 0:
+            return True
+
+        log_info("Applying Windows 7 UEFI Bootloader Patch...")
+        efi_boot_dir.mkdir(parents=True, exist_ok=True)
+
+        # Candidate 1: efi/microsoft/boot/cdboot.efi or bootmgfw.efi on target
+        ms_boot_dir = target_vol / "efi" / "microsoft" / "boot"
+        candidates = [
+            ms_boot_dir / "cdboot.efi",
+            ms_boot_dir / "bootmgfw.efi",
+            ms_boot_dir / "boot.efi"
+        ]
+        # Also check source ISO mount point
+        if self.iso.mount_point:
+            iso_ms = self.iso.mount_point / "efi" / "microsoft" / "boot"
+            candidates.extend([
+                iso_ms / "cdboot.efi",
+                iso_ms / "bootmgfw.efi",
+                iso_ms / "boot.efi"
+            ])
+
+        for c in candidates:
+            if c.exists() and c.stat().st_size > 0:
+                try:
+                    shutil.copyfile(str(c), str(bootx64))
+                    log_success(f"Windows 7 UEFI Patch applied: copied {c.name} -> /efi/boot/bootx64.efi")
+                    return True
+                except Exception as e:
+                    log_warn(f"Failed copying {c} to bootx64.efi: {e}")
+
+        # Candidate 2: Try 7z / wimlib-imagex extraction from sources/boot.wim if tools exist
+        wim_path = target_vol / "sources" / "boot.wim"
+        if not wim_path.exists() and self.iso.mount_point:
+            wim_path = self.iso.mount_point / "sources" / "boot.wim"
+
+        wimlib_bin = shutil.which("wimlib-imagex")
+        p7z_bin = shutil.which("7z") or shutil.which("7zz")
+        if wim_path.exists():
+            if wimlib_bin:
+                try:
+                    import tempfile
+                    with tempfile.TemporaryDirectory() as tmp_d:
+                        tmp_p = Path(tmp_d)
+                        run_cmd([wimlib_bin, "extract", str(wim_path), "1", "/Windows/Boot/EFI/bootmgfw.efi", f"--dest-dir={tmp_p}"], capture_output=True)
+                        extracted = tmp_p / "Windows" / "Boot" / "EFI" / "bootmgfw.efi"
+                        if extracted.exists():
+                            shutil.copyfile(str(extracted), str(bootx64))
+                            log_success("Windows 7 UEFI Patch applied: extracted bootmgfw.efi from boot.wim -> /efi/boot/bootx64.efi")
+                            return True
+                except Exception:
+                    pass
+            elif p7z_bin:
+                try:
+                    import tempfile
+                    with tempfile.TemporaryDirectory() as tmp_d:
+                        run_cmd([p7z_bin, "e", str(wim_path), "1/Windows/Boot/EFI/bootmgfw.efi", f"-o{tmp_d}", "-y"], capture_output=True)
+                        extracted = Path(tmp_d) / "bootmgfw.efi"
+                        if extracted.exists():
+                            shutil.copyfile(str(extracted), str(bootx64))
+                            log_success("Windows 7 UEFI Patch applied: extracted bootmgfw.efi via 7z -> /efi/boot/bootx64.efi")
+                            return True
+                except Exception:
+                    pass
+
+        log_warn("Could not auto-generate /efi/boot/bootx64.efi for Windows 7. Target PC will boot via standard MBR / BIOS.")
+        return False
+
+    def _write_windows_legacy(self) -> bool:
+        """Flashing engine for classic Windows releases (Windows XP / Windows Server 2003)."""
+        start_time = time.time()
+        print("\n" + "="*60)
+        print(f"{Colors.BOLD}{Colors.CYAN}Rufus for macOS - Legacy Windows (NT 5.x) Engine{Colors.RESET}")
+        print("="*60)
+        log_info(f"Target Disk:      {self.dev_node}")
+        log_info(f"Source ISO:       {self.iso.iso_path.name}")
+        log_info(f"Operating System: {self.iso.os_name}")
+        log_info(f"Partition Scheme: MBR (Master Boot Record - BIOS / CSM)")
+        log_info(f"Filesystem:       FAT32 (Classic PC-DOS / Windows Setup Boot)")
+        print("="*60 + "\n")
+
+        # Step 1: Unmount target disk
+        DiskManager.unmount_disk(self.dev_node)
+
+        # Step 2: Format single MBR FAT32 partition
+        success = self._format_single_partition()
+        if not success:
+            log_error("Partitioning failed. Aborting.")
+            return False
+
+        # Step 3: Wait for volume to mount
+        time.sleep(2)
+        boot_vol, _ = self._get_mounted_volumes()
+        if not boot_vol:
+            log_error("Could not find mounted FAT32 volume after formatting.")
+            return False
+
+        log_success(f"Installation Volume Mounted: {boot_vol}")
+
+        # Step 4: Transfer all legacy setup files directly to target volume
+        src_root = self.iso.mount_point
+        assert src_root is not None
+        log_info(f"Copying {self.iso.os_name} files to {boot_vol.name}...")
+        total_items = list(src_root.iterdir())
+        for idx, item in enumerate(total_items, 1):
+            dst_item = boot_vol / item.name
+            log_info(f"[{idx}/{len(total_items)}] Transferring {item.name}...")
+            self._copy_recursive(item, dst_item)
+
+        log_success("All installation files copied successfully.")
+
+        # Step 5: Flush disk caches
+        log_info("Flushing disk caches (sync)...")
+        subprocess.run(['sync'])
+
+        elapsed = time.time() - start_time
+        mins, secs = divmod(int(elapsed), 60)
+        print("\n" + "="*60)
+        log_success(f"BOOTABLE {self.iso.os_name.upper()} USB CREATED! ({mins}m {secs}s)")
+        print("="*60)
+        print(f"\n{Colors.BOLD}Next Steps for your PC:{Colors.RESET}")
+        print("1. Safely eject the USB drive using Finder or 'diskutil eject'.")
+        print("2. Insert the USB into the target PC.")
+        print("3. Ensure BIOS is set to Legacy BIOS / CSM boot mode (not UEFI).")
+        print("4. Power on the PC and press your BIOS boot key (F12, F11, F8, or Del).")
+        print("5. Select USB-HDD / USB Flash Drive to start Windows setup.\n")
+        return True
 
     def _write_windows(self) -> bool:
         start_time = time.time()
         print("\n" + "="*60)
-        print(f"{Colors.BOLD}{Colors.CYAN}Rufus for macOS - Windows 11 Creation Engine{Colors.RESET}")
+        print(f"{Colors.BOLD}{Colors.CYAN}Rufus for macOS - Windows Creation Engine{Colors.RESET}")
         print("="*60)
-        log_info(f"Target Disk: {self.dev_node}")
-        log_info(f"Source ISO:  {self.iso.iso_path.name}")
-        log_info(f"Architecture: {'Universal Dual-Partition (FAT32 Boot + ExFAT Data)' if self.use_dual_partition else 'Single FAT32 (Split WIM)'}")
+        log_info(f"Target Disk:      {self.dev_node}")
+        log_info(f"Source ISO:       {self.iso.iso_path.name}")
+        log_info(f"Operating System: {self.iso.os_name}")
+        log_info(f"Partition Scheme: {self.partition_scheme} ({'UEFI' if self.partition_scheme == 'GPT' else 'Legacy BIOS / CSM'})")
+        arch_desc = 'Universal Dual-Partition (FAT32 Boot + ExFAT Data)' if self.use_dual_partition else f"Single FAT32 Partition ({'Split WIM' if self.iso.is_wim_large else 'Direct WIM'})"
+        log_info(f"Architecture:     {arch_desc}")
         print("="*60 + "\n")
 
         # Step 1: Unmount target disk
@@ -735,18 +1013,39 @@ class RufusWriter:
             log_error("File transfer failed. Aborting.")
             return False
 
-        # Step 5: Inject Windows 11 Bypasses
-        unattend_xml = WindowsCustomizer.generate_autounattend(
-            bypass_tpm_secureboot=self.bypass_tpm,
-            bypass_ram_cpu_storage=self.bypass_hardware,
-            bypass_online_account=self.bypass_account,
-            disable_bitlocker=self.disable_bitlocker,
-            local_username=self.local_user
-        )
+        # Step 4.5: Windows 7 UEFI Bootloader Patch (if applicable)
+        if self.iso.has_win7_uefi_patchable or ("7" in self.iso.win_version and self.partition_scheme == "GPT"):
+            self._patch_win7_uefi(boot_vol)
+            if self.use_dual_partition and install_vol:
+                self._patch_win7_uefi(install_vol)
 
-        WindowsCustomizer.apply_bypasses(boot_vol, unattend_xml)
-        if self.use_dual_partition and install_vol:
-            WindowsCustomizer.apply_bypasses(install_vol, unattend_xml)
+        # Step 5: Inject Windows Bypasses & Customizations
+        if self.iso.is_win11:
+            log_info("Injecting Windows 11 User Experience (WUE) bypasses...")
+            unattend_xml = WindowsCustomizer.generate_autounattend(
+                bypass_tpm_secureboot=self.bypass_tpm,
+                bypass_ram_cpu_storage=self.bypass_hardware,
+                bypass_online_account=self.bypass_account,
+                disable_bitlocker=self.disable_bitlocker,
+                local_username=self.local_user
+            )
+            WindowsCustomizer.apply_bypasses(boot_vol, unattend_xml, patch_appraiser=True)
+            if self.use_dual_partition and install_vol:
+                WindowsCustomizer.apply_bypasses(install_vol, unattend_xml, patch_appraiser=True)
+        elif self.iso.win_version == "Windows 10" and (self.bypass_account or self.disable_bitlocker or self.local_user):
+            log_info("Injecting Windows 10 customizations (Account & BitLocker)...")
+            unattend_xml = WindowsCustomizer.generate_autounattend(
+                bypass_tpm_secureboot=False,
+                bypass_ram_cpu_storage=False,
+                bypass_online_account=self.bypass_account,
+                disable_bitlocker=self.disable_bitlocker,
+                local_username=self.local_user
+            )
+            WindowsCustomizer.apply_bypasses(boot_vol, unattend_xml, patch_appraiser=False)
+            if self.use_dual_partition and install_vol:
+                WindowsCustomizer.apply_bypasses(install_vol, unattend_xml, patch_appraiser=False)
+        else:
+            log_info(f"{self.iso.win_version or 'Legacy Windows'} payload: Hardware restriction bypasses not required.")
 
         # Step 6: Sync filesystem caches
         log_info("Flushing disk caches (sync)...")
@@ -755,14 +1054,22 @@ class RufusWriter:
         elapsed = time.time() - start_time
         mins, secs = divmod(int(elapsed), 60)
         print("\n" + "="*60)
-        log_success(f"BOOTABLE WINDOWS 11 USB SUCCESSFULLY CREATED! ({mins}m {secs}s)")
+        log_success(f"BOOTABLE {self.iso.os_name.upper()} USB SUCCESSFULLY CREATED! ({mins}m {secs}s)")
         print("="*60)
         print(f"\n{Colors.BOLD}Next Steps for your PC:{Colors.RESET}")
         print("1. Safely eject the USB drive using Finder or 'diskutil eject'.")
         print("2. Insert the USB into the target PC.")
-        print("3. Power on the PC and press your BIOS boot key (F12, F11, F8, or Del).")
-        print("4. Select UEFI: Kingston / USB Device from the boot menu.")
-        print(f"5. Windows 11 setup will boot cleanly with all hardware checks bypassed!\n")
+        if self.partition_scheme == "GPT":
+            print("3. Power on the PC and press your BIOS boot key (F12, F11, F8, or Del).")
+            print("4. Select 'UEFI: <Your USB Drive>' from the boot menu.")
+        else:
+            print("3. Ensure PC motherboard BIOS has CSM / Legacy BIOS boot enabled.")
+            print("4. Power on the PC and press your BIOS boot key (F12, F11, F8, or Del).")
+            print("5. Select USB-HDD / Legacy USB from the boot menu.")
+        if self.iso.is_win11:
+            print("6. Windows 11 setup will boot cleanly with all hardware checks bypassed!\n")
+        else:
+            print(f"6. {self.iso.win_version} setup will boot and proceed normally!\n")
 
         return True
 
@@ -857,10 +1164,11 @@ class RufusWriter:
         return True
 
     def _format_dual_partition(self) -> bool:
-        """Partitions disk with GPT: Partition 1: FAT32 (1.5GB, WINBOOT), Partition 2: ExFAT (Rest, WININSTALL)."""
-        log_info("Formatting USB with GPT Dual-Partition scheme...")
+        """Partitions disk with FAT32 Boot (1.5GB, WINBOOT) and ExFAT Data (Rest, WININSTALL)."""
+        scheme = self.partition_scheme
+        log_info(f"Formatting USB with {scheme} Dual-Partition scheme...")
         base_cmd = [
-            'diskutil', 'partitionDisk', self.dev_node, 'GPT',
+            'diskutil', 'partitionDisk', self.dev_node, scheme,
             'FAT32', 'WINBOOT', '1.5G',
             'ExFAT', 'WININSTALL', '0'
         ]
@@ -882,9 +1190,11 @@ class RufusWriter:
         return True
 
     def _format_single_partition(self) -> bool:
-        """Formats entire disk as a single GPT FAT32 partition."""
-        log_info("Formatting USB with GPT Single FAT32 scheme...")
-        base_cmd = ['diskutil', 'eraseDisk', 'FAT32', 'WIN11', 'GPT', self.dev_node]
+        """Formats entire disk as a single FAT32 partition."""
+        scheme = self.partition_scheme
+        vol_label = "WINXP" if self.iso.is_legacy_win else ("WIN11" if self.iso.is_win11 else "WININSTALL")
+        log_info(f"Formatting USB with {scheme} Single FAT32 scheme ({vol_label})...")
+        base_cmd = ['diskutil', 'eraseDisk', 'FAT32', vol_label, scheme, self.dev_node]
         cmd = (['sudo'] + base_cmd) if os.geteuid() != 0 else base_cmd
         log_info(f"Executing: {' '.join(cmd)}")
         if os.geteuid() != 0:
@@ -906,7 +1216,7 @@ class RufusWriter:
         boot_vol = None
         install_vol = None
 
-        # Look in /Volumes/ for WINBOOT and WININSTALL or WIN11
+        # Look in /Volumes/ for WINBOOT and WININSTALL or WIN11, WINXP
         for candidate in Path("/Volumes").iterdir():
             if not candidate.is_dir():
                 continue
@@ -914,20 +1224,23 @@ class RufusWriter:
             if name == "WINBOOT":
                 boot_vol = candidate
             elif name == "WININSTALL":
-                install_vol = candidate
-            elif name == "WIN11":
+                if self.use_dual_partition:
+                    install_vol = candidate
+                else:
+                    boot_vol = candidate
+            elif name in ["WIN11", "WINXP"]:
                 boot_vol = candidate
 
         # Fallback check via diskutil info
         if not boot_vol:
-            for part_id in [f"{self.dev_id}s2", f"{self.dev_id}s3", f"{self.dev_id}s1", f"{self.dev_id}s4"]:
+            for part_id in [f"{self.dev_id}s1", f"{self.dev_id}s2", f"{self.dev_id}s3", f"{self.dev_id}s4"]:
                 p_info = DiskManager.get_disk_info(part_id)
                 if p_info and p_info.get('Mounted', False):
                     mp = Path(p_info.get('MountPoint', ''))
                     if mp.exists():
                         if not boot_vol:
                             boot_vol = mp
-                        elif not install_vol:
+                        elif not install_vol and self.use_dual_partition:
                             install_vol = mp
 
         return boot_vol, install_vol
@@ -965,7 +1278,7 @@ class RufusWriter:
 
         # 2. Files for WININSTALL (Data & Installation Partition)
         # Needs: All ISO contents (including the full install.wim)
-        log_info("Stage 2/2: Copying complete Windows 11 installation payload to WININSTALL...")
+        log_info(f"Stage 2/2: Copying complete {self.iso.win_version or 'Windows'} installation payload to WININSTALL...")
         total_iso_files = list(src_root.iterdir())
         for idx, item in enumerate(total_iso_files, 1):
             dst_item = install_vol / item.name
@@ -976,11 +1289,11 @@ class RufusWriter:
         return True
 
     def _copy_single_partition_files(self, boot_vol: Path) -> bool:
-        """Copies all ISO files to single FAT32 partition, splitting install.wim into SWM."""
+        """Copies all ISO files to single FAT32 partition, splitting install.wim into SWM if > 4GB."""
         src_root = self.iso.mount_point
         assert src_root is not None
 
-        log_info("Copying installation files to WIN11...")
+        log_info(f"Copying installation files to {boot_vol.name}...")
         for item in src_root.iterdir():
             if item.name.lower() == "sources":
                 # Handle sources directory separately to split install.wim
@@ -988,8 +1301,12 @@ class RufusWriter:
                 dst_sources.mkdir(exist_ok=True)
                 for src_file in item.iterdir():
                     if src_file.name.lower() in ['install.wim', 'install.esd']:
-                        # Split WIM
-                        self._split_and_copy_wim(src_file, dst_sources)
+                        if src_file.stat().st_size < 4 * 1024 * 1024 * 1024:
+                            log_info(f"{src_file.name} is {format_size(src_file.stat().st_size)} (< 4GB). Direct transfer...")
+                            self._copy_file_with_progress(src_file, dst_sources / src_file.name)
+                        else:
+                            # Split WIM
+                            self._split_and_copy_wim(src_file, dst_sources)
                     else:
                         dst_file = dst_sources / src_file.name
                         self._copy_recursive(src_file, dst_file)
@@ -1181,15 +1498,59 @@ def interactive_wizard():
 
     # Step 4: Configuration Options
     enable_all = True
-    if inspector.os_type == "windows":
-        print(f"\n{Colors.BOLD}Windows User Experience (WUE) Customizations:{Colors.RESET}")
-        print(f"  [1] Bypass TPM 2.0 and Secure Boot checks     {Colors.GREEN}[Enabled]{Colors.RESET}")
-        print(f"  [2] Bypass 4GB+ RAM, Storage & CPU checks     {Colors.GREEN}[Enabled]{Colors.RESET}")
-        print(f"  [3] Bypass Online Microsoft Account (BypassNRO){Colors.GREEN}[Enabled]{Colors.RESET}")
-        print(f"  [4] Disable BitLocker Automatic Encryption    {Colors.GREEN}[Enabled]{Colors.RESET}")
+    partition_scheme = "GPT"
+    use_dual = True
 
-        customize = input("\nKeep all recommended bypasses enabled? (Y/n): ").strip().lower()
-        enable_all = (customize != 'n')
+    if inspector.os_type == "windows_legacy":
+        partition_scheme = "MBR"
+        use_dual = False
+        enable_all = False
+        print(f"\n{Colors.BOLD}Target Partition Scheme:{Colors.RESET}")
+        print(f"  [✓] Master Boot Record (MBR) for Legacy BIOS / CSM (Required for {inspector.win_version})")
+    elif inspector.os_type == "windows":
+        print(f"\n{Colors.BOLD}Select Partition Scheme & Target System:{Colors.RESET}")
+        if inspector.is_win11:
+            print(f"  [{Colors.CYAN}1{Colors.RESET}] GPT (Target: UEFI Motherboard) - {Colors.GREEN}[Recommended for Windows 11]{Colors.RESET}")
+            print(f"  [{Colors.CYAN}2{Colors.RESET}] MBR (Target: Legacy BIOS / CSM) - For older non-UEFI PCs")
+            p_choice = input("\nEnter partition scheme [1-2, default 1]: ").strip()
+            partition_scheme = "MBR" if p_choice == "2" else "GPT"
+        elif inspector.win_version in ["Windows 7", "Windows Vista"]:
+            print(f"  [{Colors.CYAN}1{Colors.RESET}] MBR (Target: Legacy BIOS / CSM) - {Colors.GREEN}[Recommended for {inspector.win_version}]{Colors.RESET}")
+            patch_note = "Supported with Windows 7 UEFI Boot Patch" if inspector.has_win7_uefi_patchable else "Requires 64-bit UEFI"
+            print(f"  [{Colors.CYAN}2{Colors.RESET}] GPT (Target: UEFI Motherboard) - {patch_note}")
+            p_choice = input("\nEnter partition scheme [1-2, default 1]: ").strip()
+            partition_scheme = "GPT" if p_choice == "2" else "MBR"
+        else:  # Windows 10, Windows 8, Windows 8.1
+            print(f"  [{Colors.CYAN}1{Colors.RESET}] GPT (Target: UEFI Motherboard) - {Colors.GREEN}[Recommended]{Colors.RESET}")
+            print(f"  [{Colors.CYAN}2{Colors.RESET}] MBR (Target: Legacy BIOS / CSM)")
+            p_choice = input("\nEnter partition scheme [1-2, default 1]: ").strip()
+            partition_scheme = "MBR" if p_choice == "2" else "GPT"
+
+        log_success(f"Selected Partition Scheme: {partition_scheme} ({'UEFI' if partition_scheme == 'GPT' else 'Legacy BIOS / CSM'})")
+
+        if not inspector.is_wim_large and partition_scheme == "MBR":
+            use_dual = False
+        else:
+            use_dual = True
+
+        if inspector.is_win11:
+            print(f"\n{Colors.BOLD}Windows User Experience (WUE) Customizations:{Colors.RESET}")
+            print(f"  [1] Bypass TPM 2.0 and Secure Boot checks       {Colors.GREEN}[Enabled]{Colors.RESET}")
+            print(f"  [2] Bypass 4GB+ RAM, Storage & CPU checks       {Colors.GREEN}[Enabled]{Colors.RESET}")
+            print(f"  [3] Bypass Online Microsoft Account (BypassNRO) {Colors.GREEN}[Enabled]{Colors.RESET}")
+            print(f"  [4] Disable BitLocker Automatic Encryption      {Colors.GREEN}[Enabled]{Colors.RESET}")
+
+            customize = input("\nKeep all recommended bypasses enabled? (Y/n): ").strip().lower()
+            enable_all = (customize != 'n')
+        elif inspector.win_version == "Windows 10":
+            print(f"\n{Colors.BOLD}Windows 10 Installation Options:{Colors.RESET}")
+            print(f"  [1] Bypass Online Microsoft Account (Local account creation) {Colors.GREEN}[Enabled]{Colors.RESET}")
+            print(f"  [2] Disable BitLocker Automatic Device Encryption            {Colors.GREEN}[Enabled]{Colors.RESET}")
+            customize = input("\nKeep recommended options enabled? (Y/n): ").strip().lower()
+            enable_all = (customize != 'n')
+        else:
+            print(f"\n{Colors.BOLD}Legacy Windows ({inspector.win_version}):{Colors.RESET} Standard installation without modern hardware locks.")
+            enable_all = False
     else:
         print(f"\n{Colors.BOLD}Operating System Payload:{Colors.RESET} {inspector.os_name}")
         print(f"  Flashing Engine: Native Block Stream (Direct Hybrid / DD Mode)")
@@ -1200,6 +1561,7 @@ def interactive_wizard():
     print("                      WARNING: DATA LOSS")
     print(f"All existing data on {selected_disk['media_name']} ({selected_disk['device_node']}) will be DESTROYED!")
     print(f"Target payload: {inspector.os_name}")
+    print(f"Partition map:  {partition_scheme} ({'UEFI' if partition_scheme == 'GPT' else 'BIOS / CSM'})")
     print("!"*65 + f"{Colors.RESET}\n")
 
     confirm = input(f"Are you sure you want to proceed and erase {selected_disk['device_node']}? (type 'YES' to confirm): ").strip()
@@ -1212,9 +1574,10 @@ def interactive_wizard():
     writer = RufusWriter(
         disk_identifier=selected_disk['identifier'],
         iso_inspector=inspector,
-        use_dual_partition=True,
-        bypass_tpm_secureboot=enable_all,
-        bypass_ram_cpu_storage=enable_all,
+        partition_scheme=partition_scheme,
+        use_dual_partition=use_dual,
+        bypass_tpm_secureboot=enable_all if inspector.is_win11 else False,
+        bypass_ram_cpu_storage=enable_all if inspector.is_win11 else False,
         bypass_online_account=enable_all,
         disable_bitlocker=enable_all
     )
@@ -1283,15 +1646,17 @@ def install_cli():
 def main():
     parser = argparse.ArgumentParser(
         description=f"Rufus for macOS (rufus-mac) {DISPLAY_VERSION} - Universal Multi-OS Bootable USB Creator for Mac",
-        epilog="Supported OS: OS X 10.9 Mavericks through macOS 27 Golden Gate (Apple Silicon & Intel) | Windows 11/10, Linux, & Raw Images"
+        epilog="Supported OS: OS X 10.9 Mavericks through macOS 27 Golden Gate (Apple Silicon & Intel) | Windows 11/10/8.1/8/7/Vista/XP, Linux, & Raw Images"
     )
     parser.add_argument("--iso", "--image", dest="iso", help="Path to OS image file (.iso, .img, .raw, .bin)")
     parser.add_argument("--target", help="Target disk identifier (e.g. disk17)")
     parser.add_argument("--list-disks", action="store_true", help="List safe USB drives and exit")
     parser.add_argument("--raw", "--dd", action="store_true", help="Force direct high-speed raw block writing mode (DD Mode)")
-    parser.add_argument("--bypass-all", action="store_true", default=True, help="Enable all Windows 11 hardware and account bypasses")
-    parser.add_argument("--no-bypass", action="store_true", help="Disable all Windows 11 bypasses")
-    parser.add_argument("--single-fat32", action="store_true", help="Use single FAT32 partition with split WIM (requires wimlib)")
+    parser.add_argument("--mbr", "--bios", dest="mbr", action="store_true", help="Force MBR partition scheme (Legacy BIOS / CSM)")
+    parser.add_argument("--gpt", "--uefi", dest="gpt", action="store_true", help="Force GPT partition scheme (UEFI)")
+    parser.add_argument("--bypass-all", action="store_true", default=True, help="Enable all Windows hardware and account bypasses")
+    parser.add_argument("--no-bypass", action="store_true", help="Disable all Windows bypasses")
+    parser.add_argument("--single-fat32", action="store_true", help="Use single FAT32 partition with split WIM if >4GB (requires wimlib)")
     parser.add_argument("--install", action="store_true", help="Install rufus-mac to system PATH (/usr/local/bin) for global access")
     parser.add_argument("-v", "--version", action="version", version=f"rufus-mac {DISPLAY_VERSION} (v{VERSION})")
 
@@ -1337,13 +1702,30 @@ def main():
     if not inspector.mount():
         sys.exit(1)
 
+    partition_scheme = "GPT"
+    if args.mbr:
+        partition_scheme = "MBR"
+    elif args.gpt:
+        partition_scheme = "GPT"
+    elif inspector.os_type == "windows_legacy" or inspector.win_version in ["Windows 7", "Windows Vista"]:
+        partition_scheme = "MBR"
+    else:
+        partition_scheme = "GPT"
+
     enable_bypasses = not args.no_bypass
+    use_dual = not args.single_fat32
+    if inspector.os_type == "windows_legacy":
+        use_dual = False
+    elif not inspector.is_wim_large and partition_scheme == "MBR":
+        use_dual = False
+
     writer = RufusWriter(
         disk_identifier=target_id,
         iso_inspector=inspector,
-        use_dual_partition=not args.single_fat32,
-        bypass_tpm_secureboot=enable_bypasses,
-        bypass_ram_cpu_storage=enable_bypasses,
+        partition_scheme=partition_scheme,
+        use_dual_partition=use_dual,
+        bypass_tpm_secureboot=enable_bypasses if inspector.is_win11 else False,
+        bypass_ram_cpu_storage=enable_bypasses if inspector.is_win11 else False,
         bypass_online_account=enable_bypasses,
         disable_bitlocker=enable_bypasses,
         force_raw=args.raw
